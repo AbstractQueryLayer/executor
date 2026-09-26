@@ -23,8 +23,8 @@
     "ifcastle/aql-result": "*",
     "ifcastle/aql-storage": "*",
     "ifcastle/aql-transaction": "*",
-    "ifcastle/design-patterns": "^0.2.20",
-    "ifcastle/di": "^0.6.0",
+    "ifcastle/design-patterns": "^0.4",
+    "ifcastle/di": "^0.8",
     "ifcastle/exceptions": "^5.0",
     "ifcastle/type-definitions": "^0.5.7"
   },

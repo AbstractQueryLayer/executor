@@ -30,9 +30,7 @@ class ExecutionContext extends Container implements ExecutionContextInterface
     {
         parent::__construct(new Resolver(), $data, $parent, true);
 
-        if ($executionPlan !== null) {
-            $this->executionPlan    = \WeakReference::create($executionPlan);
-        }
+        $this->executionPlan = $executionPlan === null ? null : \WeakReference::create($executionPlan);
     }
 
     /**

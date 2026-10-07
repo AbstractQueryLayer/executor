@@ -1088,7 +1088,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         return new InsertUpdateResult(
             $this->entityFactory->getEntity($query->getMainEntityName()),
             $query,
-            $storage->lastInsertId()
+            $storage->lastInsertId(),
+            $result->affected()
         );
     }
 

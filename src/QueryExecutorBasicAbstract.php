@@ -14,6 +14,7 @@ use IfCastle\AQL\Executor\Context\NodeContextInterface;
 use IfCastle\AQL\Executor\Exceptions\QueryException;
 use IfCastle\AQL\Executor\Plan\CommandInterface;
 use IfCastle\AQL\Executor\Plan\ExecutionContextInterface;
+use IfCastle\AQL\Executor\Plan\ExecutionContext;
 use IfCastle\AQL\Executor\Plan\ExecutionPlan;
 use IfCastle\AQL\Executor\Plan\ExecutionPlanInterface;
 use IfCastle\AQL\Executor\Plan\NormalizingPlan;
@@ -31,9 +32,7 @@ use IfCastle\AQL\Result\ResultInterface;
 use IfCastle\AQL\Storage\StorageCollectionInterface;
 use IfCastle\DesignPatterns\ScopeControl\ScopeProcessorInterface;
 use IfCastle\DI\AutoResolverInterface;
-use IfCastle\DI\Container;
 use IfCastle\DI\ContainerInterface;
-use IfCastle\DI\Resolver;
 use IfCastle\Exceptions\BaseException;
 use IfCastle\Exceptions\UnexpectedValueType;
 
@@ -43,6 +42,9 @@ abstract class QueryExecutorBasicAbstract implements
     AutoResolverInterface
 {
     protected ContainerInterface $container;
+
+    // NodeContext keeps its parent weakly; retain the per-query context for this executor's lifetime.
+    protected ?ExecutionContextInterface $executionContext = null;
 
     protected AqlExecutorInterface $aqlExecutor;
 
@@ -104,7 +106,8 @@ abstract class QueryExecutorBasicAbstract implements
             $this->additionalHandler = $executionContext->getAdditionalHandler();
         }
 
-        $this->defineQueryContext($query, $executionContext);
+        $executionContext = $this->defineQueryContext($query, $executionContext);
+        $this->executionContext = $executionContext;
         $this->normalizeQueryOrGeneratePlan($query, $executionContext);
     }
 
@@ -305,9 +308,10 @@ abstract class QueryExecutorBasicAbstract implements
     protected function defineQueryContext(
         BasicQueryInterface                                       $query,
         ExecutionContextInterface|AdditionalHandlerAwareInterface|AdditionalOptionsInterface|null $executionContext = null
-    ): void {
+    ): ?ExecutionContextInterface {
         if ($executionContext instanceof AdditionalOptionsInterface) {
-            $executionContext       = new Container(new Resolver(), $executionContext->getAdditionalOptions(), $this->container);
+            $executionContext       = (new ExecutionContext(data: $executionContext->getAdditionalOptions(), parent: $this->container))
+                ->withTransaction($executionContext->getTransaction());
         } elseif ($executionContext instanceof ExecutionContextInterface === false) {
             $executionContext       = null;
         }
@@ -329,6 +333,8 @@ abstract class QueryExecutorBasicAbstract implements
         }
 
         $this->queryContext         = \WeakReference::create($queryContext);
+
+        return $executionContext;
     }
 
     abstract protected function executeQueryWithContext(BasicQueryInterface $query, ?ExecutionContextInterface $context = null): ResultInterface;

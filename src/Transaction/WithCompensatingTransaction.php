@@ -14,13 +14,14 @@ use IfCastle\AQL\Result\InsertUpdateResultInterface;
 use IfCastle\AQL\Result\ResultInterface;
 use IfCastle\AQL\Result\TupleInterface;
 use IfCastle\AQL\Transaction\Transaction;
+use IfCastle\AQL\Transaction\TransactionStatusEnum;
 
 /**
  * Strategy for executing queries under a transaction.
  */
 class WithCompensatingTransaction implements AqlExecutorInterface
 {
-    protected \WeakReference|null $transaction;
+    protected \WeakReference|null $transaction = null;
 
     /**
      * @var BasicQueryInterface[]
@@ -33,8 +34,9 @@ class WithCompensatingTransaction implements AqlExecutorInterface
     public function executeAql(BasicQueryInterface|PreprocessedQueryInterface            $query,
         ExecutionContextInterface|AdditionalHandlerAwareInterface|AdditionalOptionsInterface|null $executionContext = null
     ): ResultInterface|TupleInterface|InsertUpdateResultInterface {
+        $transaction = $this->transaction?->get() ?? throw new \LogicException('Execute queries inside run()');
         $result                     = $this->aqlExecutor->executeAql(
-            $query, WithTransaction::addTransactionToContext($this->transaction->get(), $executionContext)
+            $query, WithTransaction::addTransactionToContext($transaction, $executionContext)
         );
 
         $this->executedQueries[]    = $query;
@@ -52,28 +54,42 @@ class WithCompensatingTransaction implements AqlExecutorInterface
 
     public function run(callable $function): mixed
     {
-        $transaction                = new Transaction($this->transactionHandler(...));
-        $this->transaction          = \WeakReference::create($transaction);
-        $this->defineTransactionId();
+        $executor                   = clone $this;
+        $executor->executedQueries  = [];
+        $transaction                = new Transaction($executor->transactionHandler(...));
+        $parent                     = $this->transaction?->get();
+
+        if ($parent !== null) {
+            $transaction->setParentTransaction($parent);
+        }
+
+        $executor->transaction      = \WeakReference::create($transaction);
 
         try {
-            $result                 = $function($this);
+            $executor->defineTransactionId();
+            $result                 = $function($executor);
             $transaction->commit();
 
             return $result;
         } catch (\Throwable $throwable) {
-            $transaction->rollBack();
+            if ($transaction->getStatus() === TransactionStatusEnum::UNDEFINED
+                || $transaction->getStatus() === TransactionStatusEnum::OPENED) {
+                $transaction->rollBack($throwable);
+            }
             throw $throwable;
         } finally {
-            $this->transaction       = null;
-            $this->executedQueries  = [];
+            $executor->transaction       = null;
+            $executor->executedQueries  = [];
         }
     }
 
     protected function defineTransactionId(): void
     {
-        /* @todo make transaction unique id */
-        $this->transaction->setTransactionId('');
+        $transaction = $this->transaction?->get() ?? throw new \LogicException('No active transaction');
+
+        if ($transaction->getTransactionId() === null) {
+            $transaction->setTransactionId(\bin2hex(\random_bytes(16)));
+        }
     }
 
     protected function transactionHandler(bool $isCommit): void {}

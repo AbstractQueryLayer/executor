@@ -17,6 +17,7 @@ use IfCastle\AQL\Result\ResultInterface;
 use IfCastle\AQL\Result\TupleInterface;
 use IfCastle\AQL\Transaction\Transaction;
 use IfCastle\AQL\Transaction\TransactionInterface;
+use IfCastle\AQL\Transaction\TransactionStatusEnum;
 
 /**
  * Strategy for executing queries under a transaction.
@@ -55,7 +56,9 @@ class WithTransaction implements AqlExecutorInterface
     public function executeAql(BasicQueryInterface|PreprocessedQueryInterface            $query,
         ExecutionContextInterface|AdditionalHandlerAwareInterface|AdditionalOptionsInterface|null $executionContext = null
     ): ResultInterface|TupleInterface|InsertUpdateResultInterface {
-        return $this->aqlExecutor->executeAql($query, self::addTransactionToContext($this->transaction?->get(), $executionContext));
+        $transaction = $this->transaction?->get() ?? throw new \LogicException('Execute queries inside run()');
+
+        return $this->aqlExecutor->executeAql($query, self::addTransactionToContext($transaction, $executionContext));
     }
 
     #[\Override]
@@ -66,21 +69,36 @@ class WithTransaction implements AqlExecutorInterface
         $this->aqlExecutor->preprocessingQuery($query, $executionContext);
     }
 
+    /**
+     * Use the executor passed to the callback for queries and nested runs.
+     * Execution contexts and options supplied to queries belong to that invocation.
+     */
     public function run(callable $function): mixed
     {
         $transaction                = new Transaction();
-        $this->transaction          = \WeakReference::create($transaction);
+        $parent                     = $this->transaction?->get();
+
+        if ($parent !== null) {
+            $transaction->setParentTransaction($parent);
+        }
+
+        // The callback gets an executor bound to this invocation, so concurrent runs share no state.
+        $executor                   = clone $this;
+        $executor->transaction      = \WeakReference::create($transaction);
 
         try {
-            $result                 = $function($this);
+            $result                 = $function($executor);
             $transaction->commit();
 
             return $result;
         } catch (\Throwable $throwable) {
-            $transaction->rollBack();
+            if ($transaction->getStatus() === TransactionStatusEnum::UNDEFINED
+                || $transaction->getStatus() === TransactionStatusEnum::OPENED) {
+                $transaction->rollBack($throwable);
+            }
             throw $throwable;
         } finally {
-            $this->transaction      = null;
+            $executor->transaction  = null;
         }
     }
 }

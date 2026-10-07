@@ -18,6 +18,7 @@ use IfCastle\AQL\Result\TupleInterface;
 use IfCastle\AQL\Transaction\Transaction;
 use IfCastle\AQL\Transaction\TransactionInterface;
 use IfCastle\AQL\Transaction\TransactionStatusEnum;
+use IfCastle\AQL\Transaction\IsolationLevelEnum;
 
 /**
  * Strategy for executing queries under a transaction.
@@ -50,7 +51,9 @@ class WithTransaction implements AqlExecutorInterface
 
     protected \WeakReference|null $transaction = null;
 
-    public function __construct(public readonly AqlExecutorInterface $aqlExecutor) {}
+    public function __construct(public readonly AqlExecutorInterface $aqlExecutor,
+        public readonly ?IsolationLevelEnum $isolationLevel = null
+    ) {}
 
     #[\Override]
     public function executeAql(BasicQueryInterface|PreprocessedQueryInterface            $query,
@@ -75,7 +78,7 @@ class WithTransaction implements AqlExecutorInterface
      */
     public function run(callable $function): mixed
     {
-        $transaction                = new Transaction();
+        $transaction                = new Transaction(isolationLevel: $this->isolationLevel);
         $parent                     = $this->transaction?->get();
 
         if ($parent !== null) {

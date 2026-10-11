@@ -1350,6 +1350,11 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
     protected function moveWrittenParts(JoinInterface $from, JoinInterface $to): void
     {
+        // A comma join has no written kind and keeps the one its relation gives.
+        if ($from->getJoinType() !== '') {
+            $to->setJoinType($from->getJoinType());
+        }
+
         if ($from->getConditions() !== null) {
             $to->setConditions($from->getConditions());
         }

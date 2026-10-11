@@ -107,20 +107,14 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ]);
         }
 
-        if ($this->scopeProcessor instanceof QueryHandlerInterface) {
-            $this->scopeProcessor->handleQuery($query, $context);
-        }
+        foreach ([$this->scopeProcessor, $this->additionalHandler] as $handler) {
+            if ($handler instanceof QueryHandlerInterface) {
+                $handler->handleQuery($query, $context);
+            }
 
-        if ($query->getSubstitution() !== null) {
-            return;
-        }
-
-        if ($this->additionalHandler instanceof QueryHandlerInterface) {
-            $this->additionalHandler->handleQuery($query, $context);
-        }
-
-        if ($query->getSubstitution() !== null) {
-            return;
+            if ($query->getSubstitution() !== null) {
+                return;
+            }
         }
 
         $entity                     = $context->getEntity($entityName);
@@ -133,10 +127,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
-        if ($query instanceof QueryInterface && $query->getFrom() !== null
-            && $query->getResolvedAction() !== QueryInterface::ACTION_INSERT) {
-            $this->defineOccurrences($query->getFrom(), $context, $entity);
-        }
+        $this->defineOccurrences($query, $context, $entity);
 
         if ($query instanceof SubqueryInterface) {
             $this->handleSubquery($query, $context);
@@ -157,8 +148,14 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
      *
      * @throws EntityDescriptorException|QueryException
      */
-    protected function defineOccurrences(JoinInterface $from, NodeContextInterface $context, EntityInterface $mainEntity): void
+    protected function defineOccurrences(BasicQueryInterface $query, NodeContextInterface $context, EntityInterface $mainEntity): void
     {
+        $from                       = $query instanceof QueryInterface ? $query->getFrom() : null;
+
+        if ($from === null || $query->getResolvedAction() === QueryInterface::ACTION_INSERT) {
+            return;
+        }
+
         $context->defineOccurrence($from, $mainEntity);
 
         foreach ($from->getChildJoins() as $join) {
@@ -303,11 +300,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         // 1. Define relation - try to find relation between entities
         // 2. Handling relation - try to handle a separate query
         //
-        if ($join->getRole() === null && $join->getConditions() !== null) {
-            $this->checkAdHocJoin($join, $context, $entity);
-        } elseif (false === ($join instanceof From) && $join->getRelation() === null) {
-            $this->defineJoinRelation($join, $context, $entity);
-        }
+        $this->defineJoinPredicate($join, $context, $entity);
 
         // If the structure has been changed, stop any analysis
         if ($join->getSubstitution() !== null) {
@@ -333,16 +326,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
         if ($entityName !== null) {
             $entity                 = $context->getEntity($entityName);
-
-            // Relation predicates name their entities on purpose; anything else must pick an occurrence.
-            if ($entityName === $entity->getEntityName() && !$context->isNamedByEntity($entityName)
-                && !NodeHelper::inRelation($column)) {
-                throw new QueryException([
-                    'template'      => 'Column {entity}.{column} is ambiguous: {entity} occurs under an alias or more than once; use the alias',
-                    'entity'        => $entityName,
-                    'column'        => $column->getColumnName(),
-                ]);
-            }
+            $this->assertNamedOccurrence($column, $entity, $context);
         } else {
             $entity                 = $context->getCurrentEntity();
             $column->setEntityName($entity->getEntityName());
@@ -1229,6 +1213,24 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     }
 
     /**
+     * @throws QueryException when the column names an entity that occurs under an alias or more than once
+     */
+    protected function assertNamedOccurrence(ColumnInterface $column, EntityInterface $entity, NodeContextInterface $context): void
+    {
+        $entityName                 = $column->getEntityName();
+
+        // Relation predicates name their entities on purpose; anything else must pick an occurrence.
+        if ($entityName === $entity->getEntityName() && !$context->isNamedByEntity($entityName)
+            && !NodeHelper::inRelation($column)) {
+            throw new QueryException([
+                'template'      => 'Column {entity}.{column} is ambiguous: {entity} occurs under an alias or more than once; use the alias',
+                'entity'        => $entityName,
+                'column'        => $column->getColumnName(),
+            ]);
+        }
+    }
+
+    /**
      * @throws EntityDescriptorException
      * @throws QueryException
      */
@@ -1353,6 +1355,18 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         $to->applyDependentJoins(...$from->getChildJoins());
+    }
+
+    /**
+     * @throws EntityDescriptorException|QueryException
+     */
+    protected function defineJoinPredicate(JoinInterface $join, NodeContextInterface $context, EntityInterface $entity): void
+    {
+        if ($join->getRole() === null && $join->getConditions() !== null) {
+            $this->checkAdHocJoin($join, $context, $entity);
+        } elseif (false === ($join instanceof From) && $join->getRelation() === null) {
+            $this->defineJoinRelation($join, $context, $entity);
+        }
     }
 
     /**

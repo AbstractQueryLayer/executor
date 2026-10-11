@@ -668,39 +668,21 @@ class NodeContext extends Container implements NodeContextInterface, DisposableI
     #[\Override]
     public function getEntity(string $entityName, bool $isRaw = false): EntityInterface
     {
-        $entity                     = $this->findQualifiedEntity(\ucfirst($entityName));
-
-        if ($entity !== null) {
-            return $entity;
-        }
-
-        // Returns derived entity if exists
-        $entity                     = $this->findDerivedContextEntity($entityName);
-
-        if ($entity !== null) {
-            return $entity;
-        }
-
-        return $this->getEntityFactory()->getEntity($entityName, $isRaw);
+        return $this->findContextEntity($entityName) ?? $this->getEntityFactory()->getEntity($entityName, $isRaw);
     }
 
     #[\Override]
     public function findEntity(string $entityName, bool $isRaw = false): ?EntityInterface
     {
-        $entity                     = $this->findQualifiedEntity(\ucfirst($entityName));
+        return $this->findContextEntity($entityName) ?? $this->getEntityFactory()->findEntity($entityName, $isRaw);
+    }
 
-        if ($entity !== null) {
-            return $entity;
-        }
-
-        // Returns derived entity if exists
-        $entity                     = $this->findDerivedContextEntity($entityName);
-
-        if ($entity !== null) {
-            return $entity;
-        }
-
-        return $this->getEntityFactory()->findEntity($entityName, $isRaw);
+    /**
+     * An occurrence or alias of this query or an outer one, else a derived entity of the context.
+     */
+    private function findContextEntity(string $entityName): ?EntityInterface
+    {
+        return $this->findQualifiedEntity(\ucfirst($entityName)) ?? $this->findDerivedContextEntity($entityName);
     }
 
     #[\Override]

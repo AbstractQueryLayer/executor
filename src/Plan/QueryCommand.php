@@ -7,6 +7,7 @@ namespace IfCastle\AQL\Executor\Plan;
 use IfCastle\AQL\Dsl\BasicQueryInterface;
 use IfCastle\AQL\Executor\Plan\ExecutionPlanInterface as QueryExecutionPlanInterface;
 use IfCastle\AQL\Result\ResultInterface;
+use IfCastle\AQL\Result\TupleInterface;
 use IfCastle\DesignPatterns\ExecutionPlan\ExecutionPlanInterface;
 use IfCastle\DesignPatterns\ExecutionPlan\WeakStaticClosureExecutor;
 
@@ -37,6 +38,14 @@ class QueryCommand extends Command implements QueryCommandInterface
 
         if ($handler instanceof ResultReaderInterface) {
             $handler->readResult($context->getResult());
+        } elseif ($handler instanceof RowModifierInterface) {
+            $result                 = $context->getResult();
+
+            if ($result instanceof TupleInterface) {
+                $rows               = $result->toArray();
+                $handler->modifyResultRows($rows, $context);
+                $result->modify($rows);
+            }
         } elseif ($handler instanceof ResultHandlerInterface) {
             $handler->handleResult($context);
         } elseif ($handler instanceof ExecutionHandlerInterface) {

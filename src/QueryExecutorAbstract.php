@@ -144,7 +144,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         if ($query->getQueryStorage() === null) {
-            $query->setQueryStorage($entity->getStorageName() ?? StorageCollectionInterface::STORAGE_MAIN);
+            $query->setQueryStorage($this->storageOf($entity));
         }
 
         $this->handleQueryAfter($query, $context);
@@ -303,7 +303,9 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         // 1. Define relation - try to find relation between entities
         // 2. Handling relation - try to handle a separate query
         //
-        if (false === ($join instanceof From) && $join->getRelation() === null) {
+        if ($join->getRole() === null && $join->getConditions() !== null) {
+            $this->checkAdHocJoin($join, $context, $entity);
+        } elseif (false === ($join instanceof From) && $join->getRelation() === null) {
             $this->defineJoinRelation($join, $context, $entity);
         }
 
@@ -1322,6 +1324,11 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             $join                   = $this->createJoinByRelation($currentRelation, $fromEntity, $toEntity);
             $join->setAlias($context->defineAlias($join->getSubject()->getSubjectName()));
 
+            // The last hop joins the target, so what the query wrote on the replaced join belongs to it.
+            if ($toEntityName === $relation->getRightEntityName()) {
+                $this->moveWrittenParts($currentJoin, $join);
+            }
+
             if ($firstJoin === null) {
                 $firstJoin         = $join;
             } else {
@@ -1339,6 +1346,48 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         $currentJoin->setSubstitution($firstJoin);
     }
 
+    protected function moveWrittenParts(JoinInterface $from, JoinInterface $to): void
+    {
+        if ($from->getConditions() !== null) {
+            $to->setConditions($from->getConditions());
+        }
+
+        $to->applyDependentJoins(...$from->getChildJoins());
+    }
+
+    /**
+     * `JOIN E e ON (…)` without a role is an ad hoc join: its ON is the whole predicate and no relation is looked
+     * up, so θ-joins and joins of an entity to itself are written directly. Its ON is rendered into one SQL
+     * statement, which needs both entities in one storage.
+     *
+     * @throws QueryException when the joined entity is in another storage
+     */
+    protected function checkAdHocJoin(JoinInterface $join, NodeContextInterface $context, EntityInterface $entity): void
+    {
+        $parentName                 = $join->getParentJoin()?->getSubject()->getSubjectName();
+
+        if ($parentName !== null && $this->storageOf($context->getEntity($parentName)) !== $this->storageOf($entity)) {
+            $this->throwOnAcrossStorages($join);
+        }
+    }
+
+    protected function storageOf(EntityInterface $entity): string
+    {
+        return $entity->getStorageName() ?? StorageCollectionInterface::STORAGE_MAIN;
+    }
+
+    /**
+     * @throws QueryException
+     */
+    protected function throwOnAcrossStorages(JoinInterface $join): never
+    {
+        throw new QueryException([
+            'template'          => 'JOIN {subject} ON (…) cannot run across storages: '
+                . 'their entities are queried separately',
+            'subject'           => $join->getAlias(),
+        ]);
+    }
+
     protected function handleJoinRelation(RelationInterface $relation, JoinInterface $join, NodeContextInterface $context, EntityInterface $entity): void
     {
         if ($relation instanceof IndirectRelationInterface) {
@@ -1351,6 +1400,10 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
         if ($relation->isConsistentRelations()) {
             return;
+        }
+
+        if ($join->getConditions() !== null) {
+            $this->throwOnAcrossStorages($join);
         }
 
         $this->createSeparateQueryForJoin($relation, $join, $context, $entity);

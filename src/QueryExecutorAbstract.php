@@ -569,8 +569,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
-        // No need alias for INSERT
-        if ($context->getBasicQuery()->getResolvedAction() === QueryInterface::ACTION_INSERT) {
+        // No alias for the target of an INSERT; the SELECT of INSERT … SELECT keeps its own
+        if ($context->getCurrentSqlQuery()->getResolvedAction() === QueryInterface::ACTION_INSERT) {
             return;
         }
 

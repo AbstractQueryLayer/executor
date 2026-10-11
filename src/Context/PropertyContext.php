@@ -14,6 +14,7 @@ use IfCastle\AQL\Dsl\Sql\Query\Expression\AssignmentListInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\Operation\LROperationInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\ValueListInterface;
 use IfCastle\AQL\Dsl\Sql\Query\QueryInterface;
+use IfCastle\AQL\Dsl\Sql\Query\SubqueryInterface;
 use IfCastle\AQL\Dsl\Sql\RawSql;
 use IfCastle\AQL\Dsl\Sql\Tuple\TupleColumn;
 use IfCastle\AQL\Dsl\Sql\Tuple\TupleColumnInterface;
@@ -291,6 +292,13 @@ class PropertyContext extends NodeContext implements PropertyContextInterface
     #[\Override]
     public function addUnSerializedColumn(TupleColumnInterface $tupleColumn, PropertyInterface $property): static
     {
+        // The rows of INSERT … SELECT go into the table, not into a result: there is nothing to unserialize.
+        $query                  = $this->getCurrentQuery();
+
+        if ($query instanceof SubqueryInterface && $query->isFromSelect() && $this->getBasicQuery()->isInsert()) {
+            return $this;
+        }
+
         $this->getQueryCommand()->getResultProcessingPlan()
             ->addRowModifier(new ColumnUnserializeHandler($tupleColumn, $property));
 

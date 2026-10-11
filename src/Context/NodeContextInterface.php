@@ -7,6 +7,8 @@ namespace IfCastle\AQL\Executor\Context;
 use IfCastle\AQL\Dsl\BasicQueryInterface;
 use IfCastle\AQL\Dsl\Node\NodeInterface;
 use IfCastle\AQL\Dsl\Node\RecursiveIteratorByNodeIteratorInterface;
+use IfCastle\AQL\Dsl\Sql\Query\Exceptions\TransformationException;
+use IfCastle\AQL\Dsl\Sql\Query\Expression\JoinInterface;
 use IfCastle\AQL\Dsl\Sql\Query\QueryInterface;
 use IfCastle\AQL\Dsl\ValueEscaperInterface;
 use IfCastle\AQL\Entity\EntityInterface;
@@ -39,6 +41,22 @@ interface NodeContextInterface extends AliasResolverInterface,
     ContainerMutableInterface,
     ParentMutableInterface
 {
+    /**
+     * Registers one occurrence of an entity in the current query (a FROM or JOIN subject) and returns the entity
+     * that represents it: the entity itself for its first occurrence, an AliasEntity named by the join's qualifier
+     * for later ones. The join's qualifier, if any, then resolves to that entity in getEntity(). Registering the
+     * same join again returns the same entity.
+     *
+     * @throws TransformationException when a later occurrence has no qualifier, or a qualifier is taken
+     */
+    public function defineOccurrence(JoinInterface $join, EntityInterface $entity): EntityInterface;
+
+    /**
+     * True when `Entity.column` names exactly one occurrence: the entity does not occur in the current query (an
+     * implicit join follows), or occurs once without an alias.
+     */
+    public function isNamedByEntity(string $entityName): bool;
+
     /**
      * @var string
      */

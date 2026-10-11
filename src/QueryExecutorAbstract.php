@@ -133,6 +133,11 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
+        if ($query instanceof QueryInterface && $query->getFrom() !== null
+            && $query->getResolvedAction() !== QueryInterface::ACTION_INSERT) {
+            $this->defineOccurrences($query->getFrom(), $context, $entity);
+        }
+
         if ($query instanceof SubqueryInterface) {
             $this->handleSubquery($query, $context);
             return;
@@ -143,6 +148,90 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         $this->handleQueryAfter($query, $context);
+    }
+
+    /**
+     * Registers every FROM and JOIN subject of the query as an occurrence before any column is resolved, so that
+     * aliases (`FROM Work w`) and later occurrences of one entity resolve in every clause. A role join
+     * (`JOIN w.publishedRevision v`) gets its entity and its relation here.
+     *
+     * @throws EntityDescriptorException|QueryException
+     */
+    protected function defineOccurrences(JoinInterface $from, NodeContextInterface $context, EntityInterface $mainEntity): void
+    {
+        $context->defineOccurrence($from, $mainEntity);
+
+        foreach ($from->getChildJoins() as $join) {
+            $this->defineJoinOccurrence($join, $context);
+        }
+    }
+
+    protected function defineJoinOccurrence(JoinInterface $join, NodeContextInterface $context): void
+    {
+        if ($join->getSubquery() !== null) {
+            return;
+        }
+
+        if ($join->getRole() !== null) {
+            $this->defineRoleJoin($join, $context);
+        } elseif ($join->getSubject()->getSubjectName() !== '') {
+            $entity                 = $context->getEntity($join->getSubject()->getSubjectName());
+            $join->getSubject()->setSubjectName($context->defineOccurrence($join, $entity)->getEntityName());
+        }
+
+        foreach ($join->getChildJoins() as $child) {
+            $this->defineJoinOccurrence($child, $context);
+        }
+    }
+
+    /**
+     * Resolves `JOIN owner.role [alias]`: the owner's relation of that name gives the joined entity and the ON
+     * predicate; a later occurrence of that entity is renamed to the alias on the relation's right side.
+     *
+     * @throws QueryException when the owner has no such role
+     */
+    protected function defineRoleJoin(JoinInterface $join, NodeContextInterface $context): void
+    {
+        [$ownerQualifier, $role]    = $join->getRole();
+
+        if ($join->getRelation() !== null) {
+            return;
+        }
+
+        $owner                      = $context->getEntity($ownerQualifier);
+        $relation                   = $owner->getRelations()[$role] ?? null;
+
+        if ($relation === null) {
+            throw new QueryException([
+                'template'          => 'Entity {entity} has no role {role} (in {owner}.{role})',
+                'entity'            => $owner->getEntityName(),
+                'owner'             => $ownerQualifier,
+                'role'              => $role,
+            ]);
+        }
+
+        $occurrence                 = $context->defineOccurrence(
+            $join, $context->getEntity($relation->getRightEntityName())
+        );
+
+        $join->getSubject()->setSubjectName($occurrence->getEntityName());
+
+        // An inherited role runs through the parent entity's table: the path expands into one join per hop.
+        if ($relation instanceof IndirectRelationInterface) {
+            if ($occurrence->getEntityName() !== $relation->getRightEntityName()) {
+                throw new QueryException([
+                    'template'      => 'Role {owner}.{role} runs through other entities; a second occurrence of its target is not supported yet',
+                    'owner'         => $ownerQualifier,
+                    'role'          => $role,
+                ]);
+            }
+
+            $this->attachToJoinIndirectRelation($relation, $join, $context);
+
+            return;
+        }
+
+        $join->setRelation($relation->cloneWithSubjects(rightEntityName: $occurrence->getEntityName()));
     }
 
     protected function handleQueryAfter(BasicQueryInterface $query, NodeContextInterface $context): void {}
@@ -242,6 +331,16 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
         if ($entityName !== null) {
             $entity                 = $context->getEntity($entityName);
+
+            // Relation predicates name their entities on purpose; anything else must pick an occurrence.
+            if ($entityName === $entity->getEntityName() && !$context->isNamedByEntity($entityName)
+                && !NodeHelper::inRelation($column)) {
+                throw new QueryException([
+                    'template'      => 'Column {entity}.{column} is ambiguous: {entity} occurs under an alias or more than once; use the alias',
+                    'entity'        => $entityName,
+                    'column'        => $column->getColumnName(),
+                ]);
+            }
         } else {
             $entity                 = $context->getCurrentEntity();
             $column->setEntityName($entity->getEntityName());
@@ -518,9 +617,11 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             //
             // and others type
             //
+            // A relation marks its left columns foreign for correlated subqueries; inside a JOIN of this query
+            // both sides belong to this query, including when the query itself is a subquery.
             $column
                 ->setSubject($entity->getSubject())
-                ->setSubjectAlias($context->defineAlias($entity, $column->isForeign()));
+                ->setSubjectAlias($context->defineAlias($entity, $column->isForeign() && !self::inJoinRelation($column)));
         }
 
         $property->handle(new PropertyContext($column, $entity, $context));
@@ -556,6 +657,11 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
+        // The entity is already a subject of the query (FROM, an explicit JOIN or a role join): nothing to add.
+        if ($query->getFrom()->findJoin($entity->getEntityName()) !== null) {
+            return;
+        }
+
         /**
          * Goal: create join by relation.
          */
@@ -572,10 +678,6 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         //
         // attaches entity to the query
         //
-
-        if ($query->getFrom()->isJoinExists($entity->getEntityName(), $currentEntity->getEntityName())) {
-            return;
-        }
 
         $joinType = NodeHelper::inTuple($column) ? $this->relationToJoinForTuple($relation) : $this->relationToJoin($relation);
 
@@ -607,6 +709,21 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ),
             $thisAlias
         );
+    }
+
+    protected static function inJoinRelation(ColumnInterface $column): bool
+    {
+        for ($node = $column->getParentNode(); $node !== null; $node = $node->getParentNode()) {
+            if ($node instanceof RelationInterface) {
+                return $node->getParentNode() instanceof JoinInterface;
+            }
+
+            if ($node instanceof QueryInterface) {
+                return false;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1148,7 +1265,12 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             // Attach to join child relations
             $this->attachToJoinIndirectRelation($relation, $join, $context);
         } else {
-            $join->setRelation($relation)->setJoinType($this->relationToJoin($relation));
+            // `JOIN` and `LEFT JOIN` keep the kind the query wrote; a comma join takes it from the relation.
+            $join->setRelation($relation);
+
+            if ($join->getJoinType() === '') {
+                $join->setJoinType($this->relationToJoin($relation));
+            }
         }
     }
 
@@ -1183,7 +1305,10 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
             $fromEntity             = $this->entityFactory->getEntity($fromEntityName);
             $toEntity               = $this->entityFactory->getEntity($toEntityName);
-            $currentRelation        = $fromEntity->getRelation($toEntityName);
+            // The last hop of an inherited role is that role of the parent entity, not any relation to the target.
+            $currentRelation        = $toEntityName === $relation->getRightEntityName()
+                ? $fromEntity->getRelations()[$relation->getRelationName()] ?? $fromEntity->getRelation($toEntityName)
+                : $fromEntity->getRelation($toEntityName);
 
             if ($currentRelation instanceof IndirectRelationInterface) {
                 throw new QueryException([

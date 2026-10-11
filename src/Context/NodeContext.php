@@ -11,7 +11,9 @@ use IfCastle\AQL\Dsl\Node\RecursiveIteratorByNodeIteratorInterface;
 use IfCastle\AQL\Dsl\Sql\FunctionReference\FunctionReference;
 use IfCastle\AQL\Dsl\Sql\FunctionReference\FunctionReferenceInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Exceptions\TransformationException;
+use IfCastle\AQL\Dsl\Sql\Query\Expression\JoinInterface;
 use IfCastle\AQL\Dsl\Sql\Query\QueryInterface;
+use IfCastle\AQL\Entity\AliasEntity;
 use IfCastle\AQL\Entity\DerivedEntity\DerivedEntityInterface;
 use IfCastle\AQL\Entity\EntityDescriptorInterface;
 use IfCastle\AQL\Entity\EntityInterface;
@@ -64,6 +66,30 @@ class NodeContext extends Container implements NodeContextInterface, DisposableI
      * Base alias prefix that is added to all aliases.
      */
     protected string $aliasesNamespace = '';
+
+    /**
+     * Query names of subject occurrences, upper-cased first letter => the entity of the occurrence.
+     * @var array<string, EntityInterface>
+     */
+    protected array $qualifiers     = [];
+
+    /**
+     * Entity name => number of its occurrences in this query.
+     * @var array<string, int>
+     */
+    protected array $occurrences    = [];
+
+    /**
+     * Entity names whose first occurrence carries an alias, so the entity name no longer names it.
+     * @var array<string, true>
+     */
+    protected array $aliasedOccurrences = [];
+
+    /**
+     * Joins already registered by defineOccurrence(), with their entities.
+     * @var \WeakMap<JoinInterface, EntityInterface>|null
+     */
+    protected ?\WeakMap $occurrenceJoins = null;
 
     /**
      * List of derived entities.
@@ -552,8 +578,102 @@ class NodeContext extends Container implements NodeContextInterface, DisposableI
     }
 
     #[\Override]
+    public function defineOccurrence(JoinInterface $join, EntityInterface $entity): EntityInterface
+    {
+        $this->occurrenceJoins      ??= new \WeakMap();
+
+        if (isset($this->occurrenceJoins[$join])) {
+            return $this->occurrenceJoins[$join];
+        }
+
+        $name                       = $entity->getEntityName();
+        $qualifier                  = $join->getQualifier();
+        $occurrence                 = $entity;
+
+        if (($this->occurrences[$name] ?? 0) > 0) {
+            if ($qualifier === '') {
+                throw new TransformationException([
+                    'template'      => 'Entity {entity} occurs more than once in the query; name the occurrence with an alias',
+                    'entity'        => $name,
+                ]);
+            }
+
+            $occurrence             = new AliasEntity(\ucfirst($qualifier), $entity);
+        }
+
+        if ($qualifier !== '') {
+            $this->defineQualifier($qualifier, $occurrence);
+        }
+
+        if ($occurrence === $entity && $qualifier !== '' && \ucfirst($qualifier) !== $name) {
+            $this->aliasedOccurrences[$name] = true;
+        }
+
+        $this->occurrences[$name]   = ($this->occurrences[$name] ?? 0) + 1;
+        $this->occurrenceJoins[$join] = $occurrence;
+
+        return $occurrence;
+    }
+
+    #[\Override]
+    public function isNamedByEntity(string $entityName): bool
+    {
+        $count                      = $this->occurrences[$entityName] ?? 0;
+
+        return $count === 0 || ($count === 1 && !isset($this->aliasedOccurrences[$entityName]));
+    }
+
+    /**
+     * @throws TransformationException when the qualifier is taken in this query or names a different entity
+     */
+    protected function defineQualifier(string $qualifier, EntityInterface $entity): void
+    {
+        $key                        = \ucfirst($qualifier);
+
+        if (\array_key_exists($key, $this->qualifiers)) {
+            throw new TransformationException([
+                'template'          => 'Alias {alias} is used twice in the query',
+                'alias'             => $qualifier,
+            ]);
+        }
+
+        // An alias spelled as another entity of the query would make `Alias.column` mean two things.
+        if ($key !== $entity->getEntityName() && \array_key_exists($key, $this->occurrences)) {
+            throw new TransformationException([
+                'template'          => 'Alias {alias} is the name of entity {entity} in the same query',
+                'alias'             => $qualifier,
+                'entity'            => $key,
+            ]);
+        }
+
+        $this->qualifiers[$key]     = $entity;
+    }
+
+    /**
+     * @param string $key a qualifier with its first letter upper-cased
+     */
+    protected function findQualifiedEntity(string $key): ?EntityInterface
+    {
+        $entity                     = $this->qualifiers[$key] ?? null;
+
+        if ($entity !== null) {
+            return $entity;
+        }
+
+        $parent                     = $this->getParentContainer();
+
+        return $parent instanceof self ? $parent->findQualifiedEntity($key) : null;
+    }
+
+    #[\Override]
     public function getEntity(string $entityName, bool $isRaw = false): EntityInterface
     {
+        $entity                     = $this->findQualifiedEntity(\ucfirst($entityName));
+
+        if ($entity !== null) {
+            return $entity;
+        }
+
         // Returns derived entity if exists
         $entity                     = $this->findDerivedContextEntity($entityName);
 
@@ -567,6 +687,12 @@ class NodeContext extends Container implements NodeContextInterface, DisposableI
     #[\Override]
     public function findEntity(string $entityName, bool $isRaw = false): ?EntityInterface
     {
+        $entity                     = $this->findQualifiedEntity(\ucfirst($entityName));
+
+        if ($entity !== null) {
+            return $entity;
+        }
+
         // Returns derived entity if exists
         $entity                     = $this->findDerivedContextEntity($entityName);
 

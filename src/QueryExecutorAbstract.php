@@ -102,7 +102,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     {
         $entityName                 = $query->getMainEntityName();
 
-        if ($entityName === '') {
+        if ($entityName === '' && !self::isSelectWithoutFrom($query)) {
             throw new QueryException([
                 'template'          => 'Main entity name is empty but required',
                 'query'             => $query,
@@ -117,6 +117,16 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             if ($query->getSubstitution() !== null) {
                 return;
             }
+        }
+
+        // No entity, so no entity handler, no occurrences and no storage of its own: the default storage runs it.
+        if ($entityName === '') {
+            if ($query->getQueryStorage() === null) {
+                $query->setQueryStorage(StorageCollectionInterface::STORAGE_MAIN);
+            }
+
+            $this->handleQueryAfter($query, $context);
+            return;
         }
 
         $entity                     = $context->getEntity($entityName);
@@ -141,6 +151,17 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         $this->handleQueryAfter($query, $context);
+    }
+
+    /**
+     * A SELECT without FROM is a row of expressions the server computes; it names no entity.
+     */
+    protected static function isSelectWithoutFrom(BasicQueryInterface $query): bool
+    {
+        return $query instanceof QueryInterface
+            && $query->isSelect()
+            && $query->getFrom() === null
+            && $query->getMainEntityName() === '';
     }
 
     /**
@@ -336,7 +357,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         // Call post-handle for query entity
-        $entity                     = $context->getEntity($query->getMainEntityName());
+        $entity                     = self::isSelectWithoutFrom($query)
+                                    ? null : $context->getEntity($query->getMainEntityName());
 
         if ($entity instanceof QueryPostHandlerInterface) {
             $entity->postHandleQuery($query, $context);
@@ -412,6 +434,14 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     #[\Override]
     public function handleColumn(ColumnInterface $column, NodeContextInterface $context): void
     {
+        if (self::isSelectWithoutFrom($context->getCurrentQuery())) {
+            throw new QueryException([
+                'template'          => 'The column {column} needs an entity, but the SELECT has no FROM: {query}',
+                'column'            => $column->getColumnName(),
+                'query'             => $context->getCurrentQuery(),
+            ]);
+        }
+
         $entityName                 = $column->getEntityName();
 
         if ($entityName !== null) {
@@ -602,9 +632,10 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
-        $entity                     = $context->getEntity(
-            $function->getEntityName() ?? $context->getCurrentEntity()->getEntityName()
-        );
+        $entityName                 = $function->getEntityName()
+                                    ?? (self::isSelectWithoutFrom($context->getCurrentQuery())
+                                        ? null : $context->getCurrentEntity()->getEntityName());
+        $entity                     = $entityName === null ? null : $context->getEntity($entityName);
 
         if ($entity instanceof FunctionHandlerInterface) {
             $entity->handleFunction($function, $context);

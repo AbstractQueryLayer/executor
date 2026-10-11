@@ -43,7 +43,12 @@ class SqlTransformer
 
         $this->defineFactories($context);
 
-        $this->normalizeMainEntity($query, $context);
+        // A SELECT without FROM has no subject: there is no main entity and no join to normalize.
+        $hasFrom                    = $query->getFrom() !== null;
+
+        if ($hasFrom) {
+            $this->normalizeMainEntity($query, $context);
+        }
 
         $queryHandler               = $context->getQueryHandler();
 
@@ -55,7 +60,9 @@ class SqlTransformer
             return;
         }
 
-        $this->transformSubjects($query, $context);
+        if ($hasFrom) {
+            $this->transformSubjects($query, $context);
+        }
 
         if ($query->getSubstitution() !== null) {
             return;
@@ -74,7 +81,9 @@ class SqlTransformer
         // Re-normalization of the node, after all transformations. Since other nodes are able to create additional JOINs,
         // we use additional normalization after all other nodes have been processed.
         //
-        $this->transformNodes($query->getFrom(), $context);
+        if ($hasFrom) {
+            $this->transformNodes($query->getFrom(), $context);
+        }
 
         //
         // If the query is a subquery and should return only one record, we set the limit to 1.

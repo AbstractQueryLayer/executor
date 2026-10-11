@@ -62,6 +62,10 @@ class AqlExecutor implements AqlExecutorInterface
             return $context->getQueryExecutor();
         }
 
+        if ($this->isWithoutEntity($query)) {
+            return $this->defineExecutorWithoutEntity($query);
+        }
+
         $entity                     = $this->entityFactory->getEntity($this->defineEntityNameByQuery($query));
         $executor                   = null;
 
@@ -74,6 +78,32 @@ class AqlExecutor implements AqlExecutorInterface
         }
 
         return $executor;
+    }
+
+    /**
+     * A SELECT without FROM reads no entity: it computes expressions on the server.
+     */
+    protected function isWithoutEntity(BasicQueryInterface $query): bool
+    {
+        return $query instanceof QueryInterface
+            && $query->isSelect()
+            && $query->getFrom() === null
+            && $query->getMainEntityName() === '';
+    }
+
+    /**
+     * The executor for a query that has no entity to name a storage: the default storage runs it.
+     *
+     * @throws QueryException
+     * @throws UnknownQueryAction
+     */
+    protected function defineExecutorWithoutEntity(BasicQueryInterface $query): QueryExecutorInterface
+    {
+        $storage                    = $this->storageCollection->findStorage(null);
+        $executor                   = $storage instanceof QueryExecutorResolverInterface
+                                    ? $storage->resolveQueryExecutor($query) : null;
+
+        return $executor ?? $this->defineDefaultExecutor($query);
     }
 
     /**

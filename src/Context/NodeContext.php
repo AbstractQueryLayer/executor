@@ -519,7 +519,12 @@ class NodeContext extends Container implements NodeContextInterface, DisposableI
     #[\Override]
     public function getStorage(): ?StorageInterface
     {
-        $storageName                = $this->getCurrentEntity()->getStorageName();
+        $query                      = $this->getCurrentQuery();
+
+        // A query without an entity (SELECT without FROM) names its storage itself; null stands for the default one.
+        $storageName                = $query->getMainEntityName() === ''
+                                    ? $query->getQueryStorage()
+                                    : $this->getCurrentEntity()->getStorageName();
         $storageCollection          = $this->resolveDependency(StorageCollectionInterface::class);
 
         if ($storageCollection instanceof StorageCollectionInterface) {

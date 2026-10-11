@@ -14,6 +14,7 @@ use IfCastle\AQL\Dsl\Sql\Conditions\ConditionsInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Exceptions\TransformationException;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\ColumnList;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\From;
+use IfCastle\AQL\Dsl\Sql\Query\Expression\Operation\Exists;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\Operation\LROperation;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\Operation\OperationInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\Subject;
@@ -90,6 +91,11 @@ class WhereEntityTransformer
      */
     protected function handleDirectRelation(DirectRelationInterface $relation, WhereEntity $whereEntity): void
     {
+        if ($whereEntity->isExclude()) {
+            $this->excludeByNotExists($relation, $whereEntity);
+            return;
+        }
+
         // Define left and right keys for build Subquery
         $leftKey                    = $relation->getLeftKey();
         $foreignKey                 = $relation->getRightKey();
@@ -104,13 +110,39 @@ class WhereEntityTransformer
         );
 
         // Build IN expression and Substitute self
-        // $leftKey [NOT] IN (Subquery)
+        // $leftKey IN (Subquery)
         $whereEntity->setSubstitution(new LROperation(
             $foreignKey->isKeySimple() ? new Column($foreignKey->getKeyColumns()[0]) : new ColumnList(...$foreignKey->getKeyColumns()),
-            $whereEntity->isExclude() ? 'NOT IN' : 'IN',
+            'IN',
             $subquery
         )
         );
+    }
+
+    /**
+     * NOT EXISTS (SELECT … FROM thisEntity WHERE thisEntity.leftKey = mainEntity.foreignKey AND conditions).
+     * NOT IN would return no row when the subquery yields a NULL key, and drop main rows whose key is NULL.
+     *
+     * @throws RequiredValueEmpty
+     * @throws ParseException
+     */
+    protected function excludeByNotExists(DirectRelationInterface $relation, WhereEntity $whereEntity): void
+    {
+        // Reversed, the relation's left side is the outer entity and its predicate marks those columns foreign.
+        $where                      = (new Where())->add($relation->reverseRelation()->generateConditions());
+        $conditions                 = $whereEntity->getConditions();
+
+        if ($conditions !== null) {
+            $where->add($conditions);
+        }
+
+        $subquery                   = new Subquery(
+            new From(new Subject($whereEntity->getEntityName())),
+            new Tuple(...$relation->getLeftKey()->getKeyColumns()),
+            $where
+        );
+
+        $whereEntity->setSubstitution(new Exists($subquery, true));
     }
 
     /**
@@ -148,6 +180,8 @@ class WhereEntityTransformer
 
         \array_shift($entitiesPath);
 
+        $isExclude                  = $whereEntity->isExclude();
+        $lastIndex                  = \array_key_last($entitiesPath);
         $prevWhereEntity            = null;
         $whereEntity                = null;
 
@@ -156,9 +190,10 @@ class WhereEntityTransformer
         // The process of generating an expression is upside down from right to left.
         // $whereEntity->setConditions((new Conditions())->add($prevWhereEntity));
         //
-        foreach ($entitiesPath as $fromEntityName) {
+        foreach ($entitiesPath as $index => $fromEntityName) {
 
-            $whereEntity            = WhereEntity::newNested($toEntityName);
+            // Only the outermost link negates: a book without such an author has no link row leading to one.
+            $whereEntity            = WhereEntity::newNested($toEntityName, null, $isExclude && $index === $lastIndex);
 
             if ($prevWhereEntity !== null) {
                 $whereEntity->setConditions((new Conditions())->add($prevWhereEntity));

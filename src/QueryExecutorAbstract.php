@@ -8,6 +8,7 @@ use IfCastle\AQL\Dsl\BasicQueryInterface;
 use IfCastle\AQL\Dsl\Node\ChildNodeMutableInterface;
 use IfCastle\AQL\Dsl\Node\Exceptions\NodeException;
 use IfCastle\AQL\Dsl\Node\NodeHelper;
+use IfCastle\AQL\Dsl\Node\NodeInterface;
 use IfCastle\AQL\Dsl\QueryOption;
 use IfCastle\AQL\Dsl\QueryOptionInterface;
 use IfCastle\AQL\Dsl\Relation\RelationDirection;
@@ -32,6 +33,7 @@ use IfCastle\AQL\Dsl\Sql\Query\Expression\WhereEntity;
 use IfCastle\AQL\Dsl\Sql\Query\Insert;
 use IfCastle\AQL\Dsl\Sql\Query\QueryInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Select;
+use IfCastle\AQL\Dsl\Sql\Query\SelectInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Subquery;
 use IfCastle\AQL\Dsl\Sql\Query\SubqueryInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Update;
@@ -139,6 +141,94 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         $this->handleQueryAfter($query, $context);
+    }
+
+    /**
+     * @throws QueryException when a lock mode stands anywhere but on a top-level SELECT without UNION members
+     */
+    #[\Override]
+    protected function normalizeQueryOrGeneratePlan(
+        BasicQueryInterface        $basicQuery,
+        ?ExecutionContextInterface $context = null
+    ): void {
+        $this->refuseLockOutsideTopLevelSelect($basicQuery);
+
+        parent::normalizeQueryOrGeneratePlan($basicQuery, $context);
+    }
+
+    /**
+     * A lock mode is meaningful on the top-level SELECT only. On a UNION member, in a subquery or in a CTE the
+     * dialects disagree on its meaning (or reject it), and the dialect checks of the executors look at the top-level
+     * query alone, so such a lock is refused for every dialect.
+     *
+     * @throws QueryException
+     */
+    protected function refuseLockOutsideTopLevelSelect(BasicQueryInterface $query): void
+    {
+        $misplaced                  = self::findLockedSelectBelow($query);
+
+        // The lock of a union head would render before the UNION keyword, which no dialect accepts.
+        if ($misplaced === null && $query instanceof SelectInterface
+            && $query->getLockMode() !== null && $query->getUnion()->isNotEmpty()) {
+            $misplaced              = $query;
+        }
+
+        if ($misplaced === null) {
+            return;
+        }
+
+        throw new QueryException([
+            'query'                 => $query,
+            'clause'                => $misplaced->getLockMode()?->value,
+            'template'              => 'A locking read ({clause}) is allowed only on the top-level SELECT,'
+                                       . ' not on a UNION member, in a subquery or in a CTE: {query}',
+        ]);
+    }
+
+    private static function findLockedSelectBelow(NodeInterface $node): ?SelectInterface
+    {
+        foreach ($node->getChildNodes() as $child) {
+            if ($child instanceof NodeInterface === false) {
+                continue;
+            }
+
+            if ($child instanceof SelectInterface && $child->getLockMode() !== null) {
+                return $child;
+            }
+
+            $found                  = self::findLockedSelectBelow($child);
+
+            if ($found !== null) {
+                return $found;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Outside a transaction a lock is released when the statement ends, so a locking read there protects nothing.
+     * The check looks at the execution context of this very execution: a path that drops the transaction from the
+     * context (a preprocessed query, a secondary command, a read routed to a replica) would turn the lock into a
+     * no-op, so the query is refused instead of running unprotected.
+     *
+     * @throws QueryException
+     */
+    protected function refuseLockingReadOutsideTransaction(BasicQueryInterface $query): void
+    {
+        $select                     = $query->resolveNode();
+
+        if ($select instanceof SelectInterface === false || $select->getLockMode() === null
+            || $this->queryContext?->get()?->getTransaction() !== null) {
+            return;
+        }
+
+        throw new QueryException([
+            'query'                 => $select,
+            'clause'                => $select->getLockMode()->value,
+            'template'              => 'A locking read ({clause}) needs a transaction: outside one the lock is'
+                                       . ' released when the statement ends; the statement is refused: {query}',
+        ]);
     }
 
     /**
@@ -822,6 +912,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         NodeContextInterface $context,
         EntityInterface      $entity,
     ): void {
+        $this->refuseSecondaryQueryUnderLock($context->getBasicQuery());
+
         if (NodeHelper::inCteOrSubquery($column)) {
             throw new QueryException([
                 'template'          => 'Generation of separate queries is not possible in the context '
@@ -896,6 +988,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         NodeContextInterface $context,
         EntityInterface $toEntity
     ): void {
+        $this->refuseSecondaryQueryUnderLock($context->getBasicQuery());
+
         if ($relation instanceof DirectRelationInterface === false) {
             throw new QueryException([
                 'query'             => $context->getBasicQuery(),
@@ -1039,6 +1133,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ]);
         }
 
+        $this->refuseLockingReadOutsideTransaction($query);
+
         if ($query->getQueryStorage() === null) {
             throw new QueryException([
                 'query'             => $query,
@@ -1086,7 +1182,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         // Support prepared queries
         if ($statement === null && $query->isOption(QueryInterface::PREPARING) && $storage instanceof SqlStatementFactoryInterface) {
 
-            $sql                    = $query->getResultAsString();
+            $sql                    = $this->renderSql($query);
 
             if ($sql === '') {
                 return new ResultNull();
@@ -1113,7 +1209,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             $context                = $this->queryContext->get();
             $operation              = static fn() => $storage->executeStatement($statement, $parameters, $context);
         } else {
-            $sql                    = $query->getResultAsString();
+            $sql                    = $this->renderSql($query);
 
             if ($sql === '') {
                 return new ResultNull();
@@ -1132,6 +1228,15 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         return $result;
+    }
+
+    /**
+     * The SQL text of a transformed query in the dialect of this executor.
+     * A dialect executor overrides it where the dialect writes a clause differently; the query is not changed.
+     */
+    protected function renderSql(BasicQueryInterface $query): string
+    {
+        return $query->getResultAsString();
     }
 
     /**

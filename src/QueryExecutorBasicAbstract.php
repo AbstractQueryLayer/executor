@@ -6,6 +6,7 @@ namespace IfCastle\AQL\Executor;
 
 use IfCastle\AQL\Dsl\BasicQueryInterface;
 use IfCastle\AQL\Dsl\Sql\Query\QueryInterface;
+use IfCastle\AQL\Dsl\Sql\Query\SelectInterface;
 use IfCastle\AQL\Dsl\Sql\Query\WithInterface;
 use IfCastle\AQL\Entity\Functions\FunctionStorageInterface;
 use IfCastle\AQL\Entity\Manager\EntityFactoryInterface;
@@ -171,6 +172,12 @@ abstract class QueryExecutorBasicAbstract implements
     #[\Override]
     public function newQueryCommand(BasicQueryInterface $query, string $target): QueryCommandInterface
     {
+        $mainQuery                  = $this->queryContext?->get()?->getBasicQuery();
+
+        if ($mainQuery !== null) {
+            $this->refuseSecondaryQueryUnderLock($mainQuery);
+        }
+
         $queryCommand               = new QueryCommand(
             $target, fn(?ExecutionContextInterface $context = null) => $context?->setResult($this->aqlExecutor->executeAql($query)), $query
         );
@@ -196,6 +203,29 @@ abstract class QueryExecutorBasicAbstract implements
     public function newQueryLeftCommand(BasicQueryInterface $query): QueryCommandInterface
     {
         return $this->newQueryCommand($query, ExecutionPlanInterface::LEFT);
+    }
+
+    /**
+     * A locking read protects only its own rows. A secondary query (one the executor adds to the plan for a join,
+     * a column or a virtual property) runs without the lock and outside the caller's context, so the lock would be
+     * lost silently; the query is refused instead.
+     *
+     * @throws QueryException when $mainQuery is a SELECT with a lock mode
+     */
+    protected function refuseSecondaryQueryUnderLock(BasicQueryInterface $mainQuery): void
+    {
+        $mainQuery                  = $mainQuery->resolveNode();
+
+        if ($mainQuery instanceof SelectInterface === false || $mainQuery->getLockMode() === null) {
+            return;
+        }
+
+        throw new QueryException([
+            'query'                 => $mainQuery,
+            'clause'                => $mainQuery->getLockMode()->value,
+            'template'              => 'A locking read ({clause}) cannot run a secondary query: its lock would not'
+                                       . ' apply to it; the statement is refused: {query}',
+        ]);
     }
 
     /**

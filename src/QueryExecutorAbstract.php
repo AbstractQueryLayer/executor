@@ -32,6 +32,7 @@ use IfCastle\AQL\Dsl\Sql\Query\Expression\SubjectInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\WhereEntity;
 use IfCastle\AQL\Dsl\Sql\Query\Insert;
 use IfCastle\AQL\Dsl\Sql\Query\QueryInterface;
+use IfCastle\AQL\Dsl\Sql\Query\UnionInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Select;
 use IfCastle\AQL\Dsl\Sql\Query\SelectInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Subquery;
@@ -434,6 +435,12 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     #[\Override]
     public function handleColumn(ColumnInterface $column, NodeContextInterface $context): void
     {
+        // ORDER BY and GROUP BY of a UNION name columns of its result, which no table alias may qualify.
+        if (self::inUnionResultClause($column)) {
+            $column->setFieldName($column->getColumnName())->setSubject('')->setSubjectAlias('');
+            return;
+        }
+
         if (self::isSelectWithoutFrom($context->getCurrentQuery())) {
             throw new QueryException([
                 'template'          => 'The column {column} needs an entity, but the SELECT has no FROM: {query}',
@@ -816,6 +823,22 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ),
             $thisAlias
         );
+    }
+
+    /** True for a column of the ORDER BY or GROUP BY of a UNION, outside its member queries. */
+    protected static function inUnionResultClause(ColumnInterface $column): bool
+    {
+        for ($node = $column->getParentNode(); $node !== null; $node = $node->getParentNode()) {
+            if ($node instanceof QueryInterface) {
+                return false;
+            }
+
+            if ($node instanceof UnionInterface) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     protected static function inJoinRelation(ColumnInterface $column): bool

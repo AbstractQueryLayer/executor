@@ -12,12 +12,14 @@ use IfCastle\AQL\Executor\Context\NodeContextInterface;
 use IfCastle\AQL\Executor\Exceptions\QueryException;
 use IfCastle\AQL\Executor\Exceptions\UnknownQueryAction;
 use IfCastle\AQL\Executor\Plan\ExecutionContextInterface;
+use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryExecutorInterface;
 use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryInterface;
 use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryStorageInterface;
 use IfCastle\AQL\Result\InsertUpdateResultInterface;
 use IfCastle\AQL\Result\ResultInterface;
 use IfCastle\AQL\Result\TupleInterface;
 use IfCastle\AQL\Storage\StorageCollectionInterface;
+use IfCastle\AQL\Transaction\TransactionInterface;
 
 class AqlExecutor implements AqlExecutorInterface
 {
@@ -39,7 +41,10 @@ class AqlExecutor implements AqlExecutorInterface
         ExecutionContextInterface|AdditionalHandlerAwareInterface|AdditionalOptionsInterface|null $executionContext = null
     ): ResultInterface|TupleInterface|InsertUpdateResultInterface {
         if ($query instanceof PreprocessedQueryInterface) {
-            return $this->resolvePreprocessedQuery($query, $executionContext)->executeQuery();
+            self::refuseShapingContext($executionContext);
+
+            return $this->resolvePreprocessedQuery($query)
+                        ->executeQuery(self::transactionOf($executionContext));
         }
 
         return $this->defineExecutor($query)->executeQuery($query, $executionContext);
@@ -107,27 +112,122 @@ class AqlExecutor implements AqlExecutorInterface
     }
 
     /**
+     * A preprocessed query is normalised once, without the caller's context, and shared by every call: an additional
+     * handler or additional options would be ignored, so they are refused, and a call carries a transaction only.
+     *
+     * @throws \LogicException
+     */
+    protected static function refuseShapingContext(
+        ExecutionContextInterface|AdditionalHandlerAwareInterface|AdditionalOptionsInterface|null $executionContext
+    ): void {
+        if ($executionContext instanceof AdditionalHandlerAwareInterface && $executionContext->getAdditionalHandler() !== null) {
+            throw new \LogicException('A preprocessed query cannot take an additional handler');
+        }
+
+        if ($executionContext instanceof AdditionalOptionsInterface && $executionContext->getAdditionalOptions() !== []) {
+            throw new \LogicException('A preprocessed query cannot take additional options');
+        }
+    }
+
+    protected static function transactionOf(
+        ExecutionContextInterface|AdditionalHandlerAwareInterface|AdditionalOptionsInterface|null $executionContext
+    ): ?TransactionInterface {
+        return $executionContext instanceof ExecutionContextInterface || $executionContext instanceof AdditionalOptionsInterface
+            ? $executionContext->getTransaction()
+            : null;
+    }
+
+    /**
+     * Returns the query preprocessed and bound to its executor: the one stored under its key, or this one, which is
+     * stored once it is bound. A query that fails to preprocess is neither bound nor stored.
+     *
      * @throws QueryException
      */
     protected function resolvePreprocessedQuery(
-        PreprocessedQueryInterface                                $preprocessedQuery,
-        ExecutionContextInterface|AdditionalHandlerAwareInterface|null $executionContext = null
+        PreprocessedQueryInterface $preprocessedQuery
     ): PreprocessedQueryInterface {
         if ($preprocessedQuery->wasPreprocessed()) {
             return $preprocessedQuery;
         }
 
-        $exists                 = $this->preprocessedQueryStorage?->findPreprocessedQuery($preprocessedQuery->getUniqueKey());
+        $key                        = $preprocessedQuery->getUniqueKey();
+        $exists                     = $key === '' ? null : $this->preprocessedQueryStorage?->findPreprocessedQuery($key);
 
-        if ($exists instanceof PreprocessedQueryInterface) {
+        if ($exists instanceof PreprocessedQueryInterface && $exists->wasPreprocessed()) {
             return $exists;
         }
 
-        $this->preprocessedQueryStorage?->storePreprocessedQuery($preprocessedQuery);
+        $this->bindPreprocessedQuery($preprocessedQuery);
 
-        $this->defineExecutor($preprocessedQuery->getQuery())->preprocessing($preprocessedQuery->getQuery(), $executionContext);
+        if ($key !== '') {
+            $this->preprocessedQueryStorage?->storePreprocessedQuery($preprocessedQuery);
+        }
 
         return $preprocessedQuery;
+    }
+
+    /**
+     * Preprocesses a new query from the provider and binds it to its executor; a query that fails to preprocess is
+     * dropped with its executor. The query is normalised without the caller's context: every call shares it, and the
+     * transaction of a call applies only to its run. A run that overlaps another run of the same query, from another
+     * coroutine, gets a query of its own from the provider: the executor holds the transaction of one run.
+     *
+     * @throws QueryException when the query builds an execution plan or is a prepared statement
+     */
+    protected function bindPreprocessedQuery(PreprocessedQueryInterface $preprocessedQuery): void
+    {
+        $query                      = $preprocessedQuery->newQuery();
+        $executor                   = $this->defineExecutor($query);
+
+        try {
+            $this->preprocessForReuse($query, $executor);
+        } catch (\Throwable $throwable) {
+            $executor->dispose();
+            throw $throwable;
+        }
+
+        $run                        = function (?TransactionInterface $transaction) use ($executor, $query, $preprocessedQuery) {
+            if ($executor->isExecuting()) {
+                return $this->executeAql($preprocessedQuery->newQuery(), new AdditionalOptions([], $transaction));
+            }
+
+            return $executor->executePreprocessed($query, $transaction);
+        };
+
+        $preprocessedQuery->defineExecutor($run, $query);
+    }
+
+    /**
+     * @phpstan-assert PreprocessedQueryExecutorInterface $executor
+     *
+     * @throws QueryException
+     */
+    protected function preprocessForReuse(BasicQueryInterface $query, QueryExecutorInterface $executor): void
+    {
+        if (false === $executor instanceof PreprocessedQueryExecutorInterface) {
+            throw new QueryException([
+                'query'             => $query,
+                'executor'          => $executor::class,
+                'template'          => 'The executor {executor} cannot run a preprocessed query',
+            ]);
+        }
+
+        if ($query->isOption(QueryInterface::PREPARING)) {
+            throw new QueryException([
+                'query'             => $query,
+                'template'          => 'A prepared statement belongs to one connection and cannot be preprocessed',
+            ]);
+        }
+
+        $executor->preprocessing($query);
+
+        // A plan changes its queries while it runs (a result reader adds the keys it read), so it cannot run twice.
+        if ($executor instanceof QueryExecutorWithPlanInterface && $executor->findExecutionPlan() !== null) {
+            throw new QueryException([
+                'query'             => $query,
+                'template'          => 'A query that builds an execution plan cannot be preprocessed',
+            ]);
+        }
     }
 
     /**

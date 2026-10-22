@@ -26,11 +26,13 @@ use IfCastle\AQL\Executor\Plan\QueryPlanInterface;
 use IfCastle\AQL\Executor\Plan\SqlQueryCommand;
 use IfCastle\AQL\Executor\PostAction\PostActionCommand;
 use IfCastle\AQL\Executor\PostAction\PostActionInterface;
+use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryExecutorInterface;
 use IfCastle\AQL\Executor\Transformer\NodeTransformer;
 use IfCastle\AQL\Executor\Transformer\Sql\CteTransformer;
 use IfCastle\AQL\Executor\Transformer\Sql\SqlTransformer;
 use IfCastle\AQL\Result\ResultInterface;
 use IfCastle\AQL\Storage\StorageCollectionInterface;
+use IfCastle\AQL\Transaction\TransactionInterface;
 use IfCastle\DesignPatterns\ScopeControl\ScopeProcessorInterface;
 use IfCastle\DI\AutoResolverInterface;
 use IfCastle\DI\ContainerInterface;
@@ -40,7 +42,8 @@ use IfCastle\Exceptions\UnexpectedValueType;
 abstract class QueryExecutorBasicAbstract implements
     QueryExecutorWithPlanInterface,
     QueryPlanInterface,
-    AutoResolverInterface
+    AutoResolverInterface,
+    PreprocessedQueryExecutorInterface
 {
     protected ContainerInterface $container;
 
@@ -70,6 +73,8 @@ abstract class QueryExecutorBasicAbstract implements
 
     protected bool $wasProcessed                = false;
 
+    protected bool $isExecuting                 = false;
+
     #[\Override]
     public function resolveDependencies(ContainerInterface $container): void
     {
@@ -93,6 +98,39 @@ abstract class QueryExecutorBasicAbstract implements
         }
 
         return $this->executeQueryWithContext($query);
+    }
+
+    #[\Override]
+    public function isExecuting(): bool
+    {
+        return $this->isExecuting;
+    }
+
+    #[\Override]
+    public function executePreprocessed(BasicQueryInterface $query, ?TransactionInterface $transaction = null): ResultInterface
+    {
+        $queryContext               = $this->queryContext?->get();
+
+        if (false === $this->wasProcessed || $queryContext === null || $queryContext->getBasicQuery() !== $query) {
+            throw new \LogicException('The executor did not preprocess this query');
+        }
+
+        if ($this->isExecuting) {
+            throw new \LogicException('The preprocessed query is already running');
+        }
+
+        // The node context keeps its parent weakly: the local variable keeps the run's context alive.
+        $runContext                 = (new ExecutionContext(parent: $this->container))->withTransaction($transaction);
+        $this->isExecuting          = true;
+        $this->executionContext     = null;
+        $queryContext->setParentContainer($runContext);
+
+        try {
+            return $this->executionPlan?->executePlanAndReturnResult() ?? $this->executeQueryWithContext($query);
+        } finally {
+            $queryContext->setParentContainer($this->container);
+            $this->isExecuting      = false;
+        }
     }
 
     #[\Override]

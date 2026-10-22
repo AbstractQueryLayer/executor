@@ -179,7 +179,10 @@ abstract class QueryExecutorBasicAbstract implements
         }
 
         $queryCommand               = new QueryCommand(
-            $target, fn(?ExecutionContextInterface $context = null) => $context?->setResult($this->aqlExecutor->executeAql($query)), $query
+            $target,
+            fn(?ExecutionContextInterface $context = null)
+                => $context?->setResult($this->aqlExecutor->executeAql($query, $this->secondaryQueryContext())),
+            $query
         );
 
         $this->getExecutionPlan()->addCommand($queryCommand);
@@ -206,8 +209,21 @@ abstract class QueryExecutorBasicAbstract implements
     }
 
     /**
+     * The context of a secondary query: one the executor adds to the plan for a join, a column or a virtual property.
+     * It carries the transaction of the main query, so the secondary query belongs to the same transaction. Each
+     * storage is a connection of its own and reads under the transaction from its first statement in it: under
+     * REPEATABLE READ a storage keeps its snapshot, but two storages do not share one. Null outside a transaction.
+     */
+    protected function secondaryQueryContext(): ?AdditionalOptionsInterface
+    {
+        $transaction                = $this->queryContext?->get()?->getTransaction();
+
+        return $transaction === null ? null : new AdditionalOptions([], $transaction);
+    }
+
+    /**
      * A locking read protects only its own rows. A secondary query (one the executor adds to the plan for a join,
-     * a column or a virtual property) runs without the lock and outside the caller's context, so the lock would be
+     * a column or a virtual property) runs in the caller's transaction but without the lock, so the lock would be
      * lost silently; the query is refused instead.
      *
      * @throws QueryException when $mainQuery is a SELECT with a lock mode

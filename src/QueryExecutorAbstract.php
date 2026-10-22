@@ -1102,7 +1102,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
                 $toCommand          = new SqlQueryCommand(
                     $this->relationToSide($relation),
-                    fn() => $this->aqlExecutor->executeAql($toQuery), $toQuery
+                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
                 );
 
                 $executionPlan->addCommand($toCommand);
@@ -1116,7 +1116,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
                 $toCommand          = new SqlQueryCommand(
                     $this->relationToSide($relation),
-                    fn() => $this->aqlExecutor->executeAql($toQuery), $toQuery
+                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
                 );
 
                 $executionPlan->addCommand($toCommand);
@@ -1136,7 +1136,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
                 $fromSelectCommand  = $normalizingPlan->defineNormalizingSqlCommand($fromQuery);
                 $toCommand          = new SqlQueryCommand(
                     $this->relationToSide($relation),
-                    fn() => $this->aqlExecutor->executeAql($toQuery), $toQuery
+                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
                 );
 
                 $executionPlan->addCommand($toCommand);
@@ -1152,7 +1152,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
                 $toCommand          = new SqlQueryCommand(
                     $side,
-                    fn() => $this->aqlExecutor->executeAql($toQuery), $toQuery
+                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
                 );
 
                 // For Delete operations all dependencies

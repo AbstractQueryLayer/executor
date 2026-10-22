@@ -12,6 +12,7 @@ use IfCastle\AQL\Executor\Context\NodeContextInterface;
 use IfCastle\AQL\Executor\Exceptions\QueryException;
 use IfCastle\AQL\Executor\Exceptions\UnknownQueryAction;
 use IfCastle\AQL\Executor\Plan\ExecutionContextInterface;
+use IfCastle\AQL\Executor\Plan\ExecutionPlan;
 use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryExecutorInterface;
 use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryInterface;
 use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryStorageInterface;
@@ -221,11 +222,13 @@ class AqlExecutor implements AqlExecutorInterface
 
         $executor->preprocessing($query);
 
-        // A plan changes its queries while it runs (a result reader adds the keys it read), so it cannot run twice.
-        if ($executor instanceof QueryExecutorWithPlanInterface && $executor->findExecutionPlan() !== null) {
+        // A plan is run again only when it reads other storages for a join: other plans may keep state of a run.
+        $plan                       = $executor instanceof QueryExecutorWithPlanInterface ? $executor->findExecutionPlan() : null;
+
+        if ($plan !== null && (false === $plan instanceof ExecutionPlan || false === $plan->isRerunnable())) {
             throw new QueryException([
                 'query'             => $query,
-                'template'          => 'A query that builds an execution plan cannot be preprocessed',
+                'template'          => 'A query whose execution plan does more than read other storages cannot be preprocessed',
             ]);
         }
     }

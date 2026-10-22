@@ -179,6 +179,24 @@ class ExecutionPlan extends BeforeAfterPlanWithMapping implements ExecutionPlanI
         }
     }
 
+    /**
+     * Whether a call may run the plan again: it holds only the commands of the main query and the queries that read
+     * other storages for it. A command of any other kind, a result composer or a row modifier may keep state of a run.
+     */
+    public function isRerunnable(): bool
+    {
+        foreach ($this->stages as $stage => $handlers) {
+            foreach ($handlers as $handler) {
+                if (false === $handler instanceof StorageJoinCommand
+                    && ($stage !== self::TARGET || false === $handler instanceof QueryCommandInterface)) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
     #[\Override]
     public function getExecutionContext(): ?ExecutionContextInterface
     {

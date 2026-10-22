@@ -60,6 +60,21 @@ class SqlRelationResolverForSelect implements ResultReaderInterface, DisposableI
             $relation               = $relation->reverseRelation();
         }
 
+        self::restrictByKeys($fromCommand, $relation, $toCommand);
+    }
+
+    /**
+     * Restricts the $toCommand query to the rows related to those the $fromCommand query reads: $fromCommand reads
+     * the key of the relation as a hidden column, and $toCommand compares its side of the relation with the list of
+     * keys read. $fromCommand must run first; its entity is the left one of $relation.
+     *
+     * @throws QueryException when the relation cannot be compared with a list of keys
+     */
+    public static function restrictByKeys(
+        SqlQueryCommandInterface $fromCommand,
+        DirectRelationInterface $relation,
+        SqlQueryCommandInterface $toCommand
+    ): void {
         $leftEntityName             = $relation->getLeftEntityName();
         $tuple                      = $fromCommand->getContainedSqlQuery()->getTuple();
         $tupleColumns               = [];
@@ -86,7 +101,8 @@ class SqlRelationResolverForSelect implements ResultReaderInterface, DisposableI
         }
 
         $columns                    = \array_map(fn(ColumnInterface $column) => $column->getColumnName(), $conditions->getRightColumns());
-        $parameter                  = \count($columns) > 1 ? new ParameterTuple($columns) : new Parameter($columns[0]);
+        $parameter                  = \count($columns) > 1
+                                    ? new ParameterTuple($columns) : new Parameter($columns[0], isValueList: true);
 
         $conditions->substituteRightExpression($parameter);
 

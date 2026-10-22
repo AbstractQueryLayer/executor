@@ -9,6 +9,7 @@ use IfCastle\AQL\Dsl\Node\ChildNodeMutableInterface;
 use IfCastle\AQL\Dsl\Node\Exceptions\NodeException;
 use IfCastle\AQL\Dsl\Node\NodeHelper;
 use IfCastle\AQL\Dsl\Node\NodeInterface;
+use IfCastle\AQL\Dsl\Node\NodeRecursiveIterator;
 use IfCastle\AQL\Dsl\QueryOptionInterface;
 use IfCastle\AQL\Dsl\Relation\RelationDirection;
 use IfCastle\AQL\Dsl\Relation\RelationInterface;
@@ -21,11 +22,11 @@ use IfCastle\AQL\Dsl\Sql\FunctionReference\FunctionReferenceInterface;
 use IfCastle\AQL\Dsl\Sql\Helpers\JoinHelper;
 use IfCastle\AQL\Dsl\Sql\Parameter\ParameterInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Copy;
-use IfCastle\AQL\Dsl\Sql\Query\Delete;
 use IfCastle\AQL\Dsl\Sql\Query\Exceptions\TransformationException;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\From;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\Join;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\JoinInterface;
+use IfCastle\AQL\Dsl\Sql\Query\Expression\Operation\LROperationInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\Operation\OperationInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\Subject;
 use IfCastle\AQL\Dsl\Sql\Query\Expression\SubjectInterface;
@@ -37,7 +38,6 @@ use IfCastle\AQL\Dsl\Sql\Query\Select;
 use IfCastle\AQL\Dsl\Sql\Query\SelectInterface;
 use IfCastle\AQL\Dsl\Sql\Query\Subquery;
 use IfCastle\AQL\Dsl\Sql\Query\SubqueryInterface;
-use IfCastle\AQL\Dsl\Sql\Query\Update;
 use IfCastle\AQL\Dsl\Sql\Tuple\Tuple;
 use IfCastle\AQL\Dsl\Sql\Tuple\TupleColumn;
 use IfCastle\AQL\Dsl\Sql\Tuple\TupleColumnInterface;
@@ -56,12 +56,10 @@ use IfCastle\AQL\Executor\Plan\CommandAwareInterface;
 use IfCastle\AQL\Executor\Plan\ExecutionContextInterface;
 use IfCastle\AQL\Executor\Plan\ExecutionPlanInterface;
 use IfCastle\AQL\Executor\Plan\NodeWithCommand;
-use IfCastle\AQL\Executor\Plan\SqlQueryCommand;
 use IfCastle\AQL\Executor\Plan\SqlQueryCommandInterface;
-use IfCastle\AQL\Executor\Resolver\SqlRelationResolverForDelete;
+use IfCastle\AQL\Executor\Plan\StorageJoinCommand;
 use IfCastle\AQL\Executor\Resolver\SqlRelationResolverForInsert;
 use IfCastle\AQL\Executor\Resolver\SqlRelationResolverForSelect;
-use IfCastle\AQL\Executor\Resolver\SqlRelationResolverForUpdate;
 use IfCastle\AQL\Executor\Transformer\WhereEntityTransformer;
 use IfCastle\AQL\Result\InsertUpdateResultInterface;
 use IfCastle\AQL\Result\InsertUpdateResultSetterInterface;
@@ -90,6 +88,9 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     SubjectHandlerInterface,
     FunctionResolverInterface
 {
+    /** Comparisons that may be true when their column is NULL, as it is for a missing related row. */
+    protected const array NULL_ACCEPTING_OPERATIONS = ['IS', 'IS NOT', '<=>'];
+
     protected bool|null $usePreparedMode = null;
 
     protected int $placeholderCounter = -1;
@@ -986,6 +987,16 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     ): void {
         $this->refuseSecondaryQueryUnderLock($context->getBasicQuery());
 
+        if ($context->getCurrentSqlQuery()->isUpdate() && NodeHelper::inAssign($column)) {
+            throw new QueryException([
+                'template'          => 'The column {column} of {entity} cannot be used in SET of {query}: the entity is'
+                                       . ' in another storage, which an UPDATE reads only to filter its own rows',
+                'column'            => $column->getColumnName(),
+                'entity'            => $entity->getEntityName(),
+                'query'             => $context->getCurrentSqlQuery()->getAql(),
+            ]);
+        }
+
         if (NodeHelper::inCteOrSubquery($column)) {
             throw new QueryException([
                 'template'          => 'Generation of separate queries is not possible in the context '
@@ -1032,10 +1043,14 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ]);
         }
 
+        if (NodeHelper::inWhere($column)) {
+            $this->refuseUnmovableCondition($targetNode, $basicNode, $context);
+        }
+
         ConsistencyHelper::checkNode($targetNode, $entity, $context);
 
         $basicNodeName              = $basicNode->getNodeName();
-        $targetNodeCopy             = clone $targetNode;
+        $targetNodeCopy             = NodeHelper::copyToTransformAgain($targetNode);
 
         if ($targetNode instanceof TupleColumnInterface) {
             $targetNode->markAsPlaceholder();
@@ -1070,29 +1085,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ]);
         }
 
-        //
-        // 1. Create new Query from Join
-        //
         $fromQuery                  = $context->getCurrentSqlQuery();
         $queryAction                = $fromQuery->getResolvedAction();
-
-        $toQuery                    = match ($queryAction) {
-            QueryInterface::ACTION_COUNT,
-            QueryInterface::ACTION_SELECT  => new Select($toEntity->getEntityName()),
-            QueryInterface::ACTION_INSERT,
-            QueryInterface::ACTION_REPLACE => new Insert($toEntity->getEntityName()),
-            QueryInterface::ACTION_COPY    => new Copy($toEntity->getEntityName()),
-            QueryInterface::ACTION_UPDATE  => new Update($toEntity->getEntityName()),
-            QueryInterface::ACTION_DELETE  => new Delete($toEntity->getEntityName()),
-
-            default                        => throw new QueryException([
-                'query'             => $fromQuery,
-                'action'            => $fromQuery->getResolvedAction(),
-                'template'          => 'Unknown parent query action {action} to create separate Query for Join',
-            ]),
-        };
-
-        $executionPlan              = $this->getExecutionPlan();
         $fromCommand                = $context->getQueryCommand();
 
         if ($fromCommand instanceof SqlQueryCommandInterface === false) {
@@ -1103,93 +1097,110 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ]);
         }
 
-        //
-        // The Delete\Update query requires the creation of a normalizing Select-query,
-        // which will first get the identifiers of the entities to be deleted, and then delete them.
-        //
+        if ($this->isRestrictedBy($fromQuery, $join, $toEntity)) {
+            $toCommand              = $this->newSecondaryCommand(
+                ExecutionPlanInterface::RIGHT, new Select($toEntity->getEntityName())
+            );
 
-        $normalizingPlan            = null;
+            $this->getExecutionPlan()->addCommand($toCommand);
+            SqlRelationResolverForSelect::restrictByKeys($toCommand, self::relationFrom($toEntity, $relation), $fromCommand);
+            $join->setSubstitution(new NodeWithCommand($toCommand));
 
-        if ($fromQuery->isInsertUpdate()) {
-            $this->defineNormalizingPlan($context);
-            $normalizingPlan        = $context->getQueryExecutor()->getNormalizingPlan();
+            return;
         }
 
-        switch ($queryAction) {
-            case QueryInterface::ACTION_SELECT:
+        $toQuery                    = match ($queryAction) {
+            QueryInterface::ACTION_COUNT,
+            QueryInterface::ACTION_SELECT  => new Select($toEntity->getEntityName()),
+            QueryInterface::ACTION_INSERT,
+            QueryInterface::ACTION_REPLACE => new Insert($toEntity->getEntityName()),
+            QueryInterface::ACTION_COPY    => new Copy($toEntity->getEntityName()),
 
-                $toCommand          = new SqlQueryCommand(
-                    $this->relationToSide($relation),
-                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
-                );
+            default                        => throw new QueryException([
+                'query'             => $fromQuery,
+                'action'            => $fromQuery->getResolvedAction(),
+                'template'          => 'Unknown parent query action {action} to create separate Query for Join',
+            ]),
+        };
 
-                $executionPlan->addCommand($toCommand);
-                SqlRelationResolverForSelect::resolve($fromCommand, $relation, $toCommand);
+        $toCommand                  = $this->newSecondaryCommand($this->relationToSide($relation), $toQuery);
+        $this->getExecutionPlan()->addCommand($toCommand);
 
-                break;
-
-            case QueryInterface::ACTION_INSERT:
-            case QueryInterface::ACTION_REPLACE:
-            case QueryInterface::ACTION_COPY:
-
-                $toCommand          = new SqlQueryCommand(
-                    $this->relationToSide($relation),
-                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
-                );
-
-                $executionPlan->addCommand($toCommand);
-                SqlRelationResolverForInsert::resolve($context, $toCommand, $relation, $fromCommand);
-                break;
-
-            case QueryInterface::ACTION_UPDATE:
-
-                //
-                // For UPDATE DELETE queries, we must use a normalization SELECT query to determine the dependencies.
-                // So the code logic is:
-                // 1. Create a SELECT query that will receive dependent data
-                // 2. Associate it with the current query
-                //
-
-                // Build normalizing select
-                $fromSelectCommand  = $normalizingPlan->defineNormalizingSqlCommand($fromQuery);
-                $toCommand          = new SqlQueryCommand(
-                    $this->relationToSide($relation),
-                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
-                );
-
-                $executionPlan->addCommand($toCommand);
-
-                SqlRelationResolverForUpdate::resolve($toCommand, $relation, $fromSelectCommand);
-                break;
-
-            case QueryInterface::ACTION_DELETE:
-
-                $fromSelectCommand  = $normalizingPlan->defineNormalizingSqlCommand($fromQuery);
-
-                $side               = $this->relationToSide($relation, true);
-
-                $toCommand          = new SqlQueryCommand(
-                    $side,
-                    fn() => $this->aqlExecutor->executeAql($toQuery, $this->secondaryQueryContext()), $toQuery
-                );
-
-                // For Delete operations all dependencies
-                // should be executed in reverse order
-                $executionPlan->addCommand(command: $toCommand, toStart: $side === ExecutionPlanInterface::RIGHT);
-
-                SqlRelationResolverForDelete::resolve($toCommand, $relation, $fromSelectCommand);
-                break;
-
-            default:
-
-                throw new QueryException([
-                    'query'             => $fromQuery,
-                    'action'            => $fromQuery->getResolvedAction(),
-                    'template'          => 'Unknown parent query action {action} to create separate Query for Join',
-                ]);
+        if ($queryAction === QueryInterface::ACTION_SELECT) {
+            SqlRelationResolverForSelect::resolve($fromCommand, $relation, $toCommand);
+        } else {
+            SqlRelationResolverForInsert::resolve($context, $toCommand, $relation, $fromCommand);
         }
 
         $join->setSubstitution(new NodeWithCommand($toCommand));
+    }
+
+    /**
+     * A condition on an entity in another storage moves to the query of that entity, which runs first: the main query
+     * keeps the rows related to the rows it reads. That is right only for a condition joined to the rest by AND and
+     * false on a missing related row; anything else would change the result silently, so it is refused.
+     *
+     * @throws QueryException when the condition is under OR, or may be true for a missing row (IS, <=>, a function)
+     */
+    protected function refuseUnmovableCondition(NodeInterface $condition, NodeInterface $parent, NodeContextInterface $context): void
+    {
+        $operation                  = $condition instanceof LROperationInterface ? \strtoupper($condition->getOperation()) : null;
+        $isMovable                  = $parent === $context->getCurrentSqlQuery()->getWhere()
+                                      && $operation !== null
+                                      && false === \in_array($operation, self::NULL_ACCEPTING_OPERATIONS, true);
+
+        foreach (new \RecursiveIteratorIterator(new NodeRecursiveIterator($condition), \RecursiveIteratorIterator::SELF_FIRST) as $node) {
+            $isMovable              = $isMovable && false === $node instanceof FunctionReferenceInterface;
+        }
+
+        if ($isMovable) {
+            return;
+        }
+
+        throw new QueryException([
+            'template'          => 'The condition {condition} on an entity in another storage must be a condition of'
+                                   . ' WHERE joined by AND and false for a missing row (no IS, <=> or function): {query}',
+            'condition'         => $condition->getAql(),
+            'query'             => $context->getCurrentSqlQuery()->getAql(),
+        ]);
+    }
+
+    /**
+     * Whether the query keeps only the rows related to rows of $entity it selects: a WHERE on the entity, or any UPDATE
+     * or DELETE, which change only their own entity and use another one as a filter. The entity is then queried first
+     * and the query is restricted to the keys read, as a semi-join: a row of the query is kept once however many rows
+     * of the entity it relates to.
+     */
+    protected function isRestrictedBy(QueryInterface $query, JoinInterface $join, EntityInterface $entity): bool
+    {
+        if ($query->isUpdate() || $query->isDelete()) {
+            return true;
+        }
+
+        $where                      = $query->getWhere();
+
+        if ($where === null) {
+            return false;
+        }
+
+        return NodeHelper::findColumnByEntity($where, $entity->getEntityName()) !== null
+            || NodeHelper::findColumnByEntity($where, $join->getAlias()) !== null;
+    }
+
+    /**
+     * The relation seen from $entity: its left side is the entity.
+     */
+    protected static function relationFrom(EntityInterface $entity, DirectRelationInterface $relation): DirectRelationInterface
+    {
+        return $relation->getLeftEntityName() === $entity->getEntityName() ? $relation : $relation->reverseRelation();
+    }
+
+    /**
+     * A command of the plan that runs $query, a query on another storage, in the transaction of the main query.
+     */
+    protected function newSecondaryCommand(string $stage, QueryInterface $query): StorageJoinCommand
+    {
+        return new StorageJoinCommand($stage, fn() => $this->executeSecondaryQuery($query), $query);
     }
 
     /**

@@ -219,7 +219,7 @@ abstract class QueryExecutorBasicAbstract implements
         $queryCommand               = new QueryCommand(
             $target,
             fn(?ExecutionContextInterface $context = null)
-                => $context?->setResult($this->aqlExecutor->executeAql($query, $this->secondaryQueryContext())),
+                => $context?->setResult($this->executeSecondaryQuery($query)),
             $query
         );
 
@@ -244,6 +244,23 @@ abstract class QueryExecutorBasicAbstract implements
     public function newQueryLeftCommand(BasicQueryInterface $query): QueryCommandInterface
     {
         return $this->newQueryCommand($query, ExecutionPlanInterface::LEFT);
+    }
+
+    /**
+     * Runs a secondary query in the transaction of the main query. The plan of a preprocessed query runs once per call:
+     * from the second run on, its secondary queries are preprocessed already and run in the transaction of this call,
+     * not of the call that preprocessed them.
+     */
+    protected function executeSecondaryQuery(BasicQueryInterface $query): ResultInterface
+    {
+        $executor                   = $query->getNodeContext()?->getQueryExecutor();
+
+        if ($executor instanceof PreprocessedQueryExecutorInterface) {
+            // A run that overlaps another gets a query of its own (AqlExecutor), so its secondary queries never overlap.
+            return $executor->executePreprocessed($query, $this->queryContext?->get()?->getTransaction());
+        }
+
+        return $this->aqlExecutor->executeAql($query, $this->secondaryQueryContext());
     }
 
     /**

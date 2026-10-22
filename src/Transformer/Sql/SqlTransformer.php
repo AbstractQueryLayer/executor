@@ -85,6 +85,14 @@ class SqlTransformer
             $this->transformNodes($query->getFrom(), $context);
         }
 
+        // A join to another storage, handled above, adds its key to the tuple as a hidden column or restricts the
+        // WHERE by the keys it reads: both after they were normalized.
+        foreach ([$query->getTuple(), $query->getWhere()] as $node) {
+            if ($node !== null) {
+                $this->transformNodes($node, $context);
+            }
+        }
+
         //
         // If the query is a subquery and should return only one record, we set the limit to 1.
         //

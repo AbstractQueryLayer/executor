@@ -9,7 +9,6 @@ use IfCastle\AQL\Dsl\Node\ChildNodeMutableInterface;
 use IfCastle\AQL\Dsl\Node\Exceptions\NodeException;
 use IfCastle\AQL\Dsl\Node\NodeHelper;
 use IfCastle\AQL\Dsl\Node\NodeInterface;
-use IfCastle\AQL\Dsl\QueryOption;
 use IfCastle\AQL\Dsl\QueryOptionInterface;
 use IfCastle\AQL\Dsl\Relation\RelationDirection;
 use IfCastle\AQL\Dsl\Relation\RelationInterface;
@@ -17,6 +16,7 @@ use IfCastle\AQL\Dsl\Sql\Column\Column;
 use IfCastle\AQL\Dsl\Sql\Column\ColumnInterface;
 use IfCastle\AQL\Dsl\Sql\Conditions\ConditionsInterface;
 use IfCastle\AQL\Dsl\Sql\Constant\ConstantInterface;
+use IfCastle\AQL\Dsl\Sql\Constant\ConstantTupleInterface;
 use IfCastle\AQL\Dsl\Sql\FunctionReference\FunctionReferenceInterface;
 use IfCastle\AQL\Dsl\Sql\Helpers\JoinHelper;
 use IfCastle\AQL\Dsl\Sql\Parameter\ParameterInterface;
@@ -93,6 +93,14 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     protected bool|null $usePreparedMode = null;
 
     protected int $placeholderCounter = -1;
+
+    /**
+     * The constants that rendered a placeholder into the SQL of a prepared query, by placeholder: what its
+     * statement binds.
+     *
+     * @var array<string, ConstantInterface>
+     */
+    protected array $preparedConstants = [];
 
     /**
      *
@@ -502,19 +510,14 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         // Only parameters are added to the query parameters list
         if ($constant instanceof ParameterInterface) {
             $context->getMainSqlQuery()->addQueryParameter($constant);
-
-            if ($constant->isValueList()) {
-                $context->getMainSqlQuery()->getQueryOptions()
-                    ->addOption(new QueryOption(QueryInterface::PREPARING, false, true))
-                    ->addOption(new QueryOption(QueryInterface::NO_STRINGABLE, true, true));
-            }
-
-            $this->usePreparedMode = false;
         }
 
         if ($this->usePreparedMode === null) {
             $this->definePreparedMode();
         }
+
+        // A generator left by an executor that rendered the constant before would record it there, not here.
+        $constant->resetResultGenerator();
 
         if ($this->usePreparedMode === false) {
             return;
@@ -524,14 +527,29 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
-        if ($constant->getPlaceholder() === null) {
-            $constant->asPlaceholder($this->generatePlaceholderName());
+        // A placeholder takes one value, so a value list stays in the statement text.
+        if ($constant->isValueList() || $constant instanceof ConstantTupleInterface) {
+            return;
         }
 
-        // All constant values are set in the query as bind parameters
-        if (false === $constant instanceof ParameterInterface) {
-            $context->getSqlStatement()?->bindParameter($constant);
-        }
+        // The placeholder is given when the constant renders, so that only what reaches the SQL is bound: a node
+        // may write the value of its constant itself (LIMIT) or leave it out (the offset of a DELETE LIMIT).
+        $constant->setResultGenerator($this->renderPlaceholder(...));
+    }
+
+    /**
+     * Renders the constant of a prepared query as a new placeholder and records it for binding. Each occurrence has
+     * a placeholder of its own, a repeated named parameter too: PDO without emulated prepares refuses a placeholder
+     * that appears twice. A placeholder left from an earlier render is not reused: the names start again from the
+     * first at each render.
+     */
+    private function renderPlaceholder(ConstantInterface $constant): string
+    {
+        $placeholder                = $this->generatePlaceholderName();
+        $constant->asPlaceholder($placeholder);
+        $this->preparedConstants[$placeholder] = $constant;
+
+        return $placeholder;
     }
 
     protected function generatePlaceholderName(): string
@@ -1234,20 +1252,26 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         $statement                  = $this->queryContext->get()->getSqlStatement();
 
         // Support prepared queries
-        if ($statement === null && $query->isOption(QueryInterface::PREPARING) && $storage instanceof SqlStatementFactoryInterface) {
+        if ($query->isOption(QueryInterface::PREPARING) && $storage instanceof SqlStatementFactoryInterface) {
 
-            $sql                    = $this->renderSql($query);
+            // Rendered and prepared again on every run: a value written into the text (a value list, a LIMIT) may
+            // have changed since the last one, and a statement belongs to the connection of the run that prepared it.
+            [$sql, $constants]      = $this->renderPrepared($query);
 
             if ($sql === '') {
                 return new ResultNull();
             }
 
             $statement              = $storage->createStatement($sql, $this->queryContext);
+
+            foreach ($constants as $constant) {
+                $statement->bindParameter($constant);
+            }
+
             $this->queryContext->get()->setSqlStatement($statement);
-            $parameters             = $this->extractQueryParameters($query);
             $context                = $this->queryContext->get();
 
-            $operation              = static fn() => $storage->executeStatement($statement, $parameters, $context);
+            $operation              = static fn() => $storage->executeStatement($statement, [], $context);
 
         } elseif ($statement !== null) {
 
@@ -1259,9 +1283,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
                 ]);
             }
 
-            $parameters             = $this->extractQueryParameters($query);
             $context                = $this->queryContext->get();
-            $operation              = static fn() => $storage->executeStatement($statement, $parameters, $context);
+            $operation              = static fn() => $storage->executeStatement($statement, [], $context);
         } else {
             $sql                    = $this->renderSql($query);
 
@@ -1294,6 +1317,20 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     }
 
     /**
+     * Renders a prepared query: its SQL and the constants its placeholders bind, by placeholder.
+     *
+     * @return array{string, array<string, ConstantInterface>}
+     */
+    private function renderPrepared(BasicQueryInterface $query): array
+    {
+        $this->preparedConstants    = [];
+        $this->placeholderCounter   = -1;
+        $sql                        = $this->renderSql($query);
+
+        return [$sql, $this->preparedConstants];
+    }
+
+    /**
      * Try to execute the query twice if catch RecoverableException.
      *
      * @throws RecoverableException
@@ -1314,35 +1351,6 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             throw $recoverableException;
 
         }
-    }
-
-    /**
-     * @throws QueryException
-     */
-    protected function extractQueryParameters(BasicQueryInterface $query): array
-    {
-        if (false === $query instanceof QueryInterface) {
-            return [];
-        }
-
-        $parameters                 = [];
-
-        foreach ($query->getQueryParameters() as $parameter) {
-            $placeholder            = $parameter->getPlaceholder();
-
-            if ($placeholder === null) {
-                throw new QueryException([
-                    'query'         => $query,
-                    'template'      => 'The placeholder for the parameter {parameter} {class} is not defined',
-                    'class'         => $parameter::class,
-                    'parameter'     => $parameter instanceof ParameterInterface ? $parameter->getParameterName() : '',
-                ]);
-            }
-
-            $parameters[$placeholder] = $parameter->getConstantValue();
-        }
-
-        return $parameters;
     }
 
     protected function buildInsertUpdateResult(QueryInterface $query, SqlStorageInterface $storage, ResultInterface $result): InsertUpdateResultInterface

@@ -6,6 +6,7 @@ namespace IfCastle\AQL\Executor\Plan;
 
 use IfCastle\AQL\Dsl\BasicQueryInterface;
 use IfCastle\AQL\Executor\Exceptions\QueryException;
+use IfCastle\AQL\Executor\ResultComposer\StorageJoinComposer;
 use IfCastle\AQL\Result\ResultInterface;
 use IfCastle\AQL\Result\TupleInterface;
 use IfCastle\DesignPatterns\ExecutionPlan\BeforeAfterPlanWithMapping;
@@ -180,15 +181,17 @@ class ExecutionPlan extends BeforeAfterPlanWithMapping implements ExecutionPlanI
     }
 
     /**
-     * Whether a call may run the plan again: it holds only the commands of the main query and the queries that read
-     * other storages for it. A command of any other kind, a result composer or a row modifier may keep state of a run.
+     * Whether a call may run the plan again: it holds only the commands of the main query, the queries that read
+     * other storages for it and the composers of their rows, which keep the rows of one run. A command of any other
+     * kind, another result composer or a row modifier may keep state of a run.
      */
     public function isRerunnable(): bool
     {
         foreach ($this->stages as $stage => $handlers) {
             foreach ($handlers as $handler) {
                 if (false === $handler instanceof StorageJoinCommand
-                    && ($stage !== self::TARGET || false === $handler instanceof QueryCommandInterface)) {
+                    && ($stage !== self::TARGET || false === $handler instanceof QueryCommandInterface)
+                    && ($stage !== self::RESULT_COMPOSER || false === $handler instanceof StorageJoinComposer)) {
                     return false;
                 }
             }

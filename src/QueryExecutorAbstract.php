@@ -57,10 +57,13 @@ use IfCastle\AQL\Executor\Plan\CommandAwareInterface;
 use IfCastle\AQL\Executor\Plan\ExecutionContextInterface;
 use IfCastle\AQL\Executor\Plan\ExecutionPlanInterface;
 use IfCastle\AQL\Executor\Plan\NodeWithCommand;
+use IfCastle\AQL\Executor\Plan\ResultReaderCallback;
 use IfCastle\AQL\Executor\Plan\SqlQueryCommandInterface;
 use IfCastle\AQL\Executor\Plan\StorageJoinCommand;
 use IfCastle\AQL\Executor\Resolver\SqlRelationResolverForInsert;
+use IfCastle\AQL\Executor\Resolver\SqlRelationResolverForJoin;
 use IfCastle\AQL\Executor\Resolver\SqlRelationResolverForSelect;
+use IfCastle\AQL\Executor\ResultComposer\StorageJoinComposer;
 use IfCastle\AQL\Executor\Transformer\WhereEntityTransformer;
 use IfCastle\AQL\Result\InsertUpdateResultInterface;
 use IfCastle\AQL\Result\InsertUpdateResultSetterInterface;
@@ -103,6 +106,28 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
      * @var array<string, ConstantInterface>
      */
     protected array $preparedConstants = [];
+
+    /**
+     * The joins the query wrote, as opposed to those the executor adds for a column: a written join to an entity of
+     * another storage is composed row by row, as one statement joins it.
+     *
+     * @var \WeakMap<JoinInterface, true>|null
+     */
+    private ?\WeakMap $writtenJoins = null;
+
+    /**
+     * The entities of other storages joined row by row, by name: the type of their join and the composer of their rows.
+     *
+     * @var array<string, array{string, StorageJoinComposer}>
+     */
+    private array $storageJoins = [];
+
+    /**
+     * Tuple columns of an entity of another storage handled before its join was composed: entity name => aliases.
+     *
+     * @var array<string, list<string>>
+     */
+    private array $storageJoinColumns = [];
 
     /**
      *
@@ -290,6 +315,9 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         if ($join->getSubquery() !== null) {
             return;
         }
+
+        $this->writtenJoins         ??= new \WeakMap();
+        $this->writtenJoins[$join]  = true;
 
         if ($join->getRole() !== null) {
             $this->defineRoleJoin($join, $context);
@@ -1094,7 +1122,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             'column'                => $column->getColumnName(),
         ]);
 
-        $basicNode                  = $targetNode->getParentNode();
+        $basicNode                  = NodeHelper::ascendToQueryBasicNode($column);
 
         if ($basicNode === null) {
             throw new QueryException([
@@ -1115,8 +1143,15 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         if (NodeHelper::inWhere($column)) {
-            $this->refuseUnmovableCondition($targetNode, $basicNode, $context);
+            $this->refuseUnmovableCondition($targetNode, $basicNode, $context, $entity);
         }
+
+        SqlRelationResolverForJoin::refuseMixedExpression(
+            $targetNode,
+            $entity,
+            static fn(string $entityName) => $context->getEntity($entityName)->getEntityName(),
+            $context->getCurrentSqlQuery()
+        );
 
         ConsistencyHelper::checkNode($targetNode, $entity, $context);
 
@@ -1125,6 +1160,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
         if ($targetNode instanceof TupleColumnInterface) {
             $targetNode->markAsPlaceholder();
+            $this->addStorageJoinColumn($entity->getEntityName(), $targetNode->getAliasOrColumnName());
         } else {
             $targetNode->substituteToNullNode();
         }
@@ -1166,6 +1202,15 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
                 'command'           => \get_debug_type($fromCommand),
                 'template'          => 'The current Query executor can only process SQL queries and commands, got {command}',
             ]);
+        }
+
+        $joinType                   = \in_array($queryAction, [QueryInterface::ACTION_SELECT, QueryInterface::ACTION_COUNT], true)
+                                    ? $this->storageJoinType($join, $relation, $fromQuery, $toEntity) : null;
+
+        if ($joinType !== null) {
+            $this->composeStorageJoin($relation, $join, $fromCommand, $toEntity, $joinType);
+
+            return;
         }
 
         if ($this->isRestrictedBy($fromQuery, $join, $toEntity)) {
@@ -1211,14 +1256,21 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
      * keeps the rows related to the rows it reads. That is right only for a condition joined to the rest by AND and
      * false on a missing related row; anything else would change the result silently, so it is refused.
      *
+     * Under an INNER join composed row by row a missing row is dropped anyway, so IS and IS NOT move too; under a LEFT
+     * one `IS NOT NULL` does, as it is false for a missing row.
+     *
      * @throws QueryException when the condition is under OR, or may be true for a missing row (IS, <=>, a function)
      */
-    protected function refuseUnmovableCondition(NodeInterface $condition, NodeInterface $parent, NodeContextInterface $context): void
-    {
+    protected function refuseUnmovableCondition(
+        NodeInterface $condition,
+        NodeInterface $parent,
+        NodeContextInterface $context,
+        EntityInterface $entity
+    ): void {
         $operation                  = $condition instanceof LROperationInterface ? \strtoupper($condition->getOperation()) : null;
         $isMovable                  = $parent === $context->getCurrentSqlQuery()->getWhere()
                                       && $operation !== null
-                                      && false === \in_array($operation, self::NULL_ACCEPTING_OPERATIONS, true);
+                                      && $this->isFalseForMissingRow($condition, $operation, $entity);
 
         foreach (new \RecursiveIteratorIterator(new NodeRecursiveIterator($condition), \RecursiveIteratorIterator::SELF_FIRST) as $node) {
             $isMovable              = $isMovable && false === $node instanceof FunctionReferenceInterface;
@@ -1234,6 +1286,23 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             'condition'         => $condition->getAql(),
             'query'             => $context->getCurrentSqlQuery()->getAql(),
         ]);
+    }
+
+    private function isFalseForMissingRow(LROperationInterface $condition, string $operation, EntityInterface $entity): bool
+    {
+        if (false === \in_array($operation, self::NULL_ACCEPTING_OPERATIONS, true)) {
+            return true;
+        }
+
+        $joinType                   = $this->storageJoins[$entity->getEntityName()][0] ?? null;
+        $right                      = $condition->getRightNode();
+
+        return match ($joinType) {
+            JoinInterface::INNER    => $operation !== '<=>',
+            JoinInterface::LEFT     => $operation === 'IS NOT'
+                                       && $right instanceof ConstantInterface && $right->getConstantValue() === null,
+            default                 => false,
+        };
     }
 
     /**
@@ -1256,6 +1325,170 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
         return NodeHelper::findColumnByEntity($where, $entity->getEntityName()) !== null
             || NodeHelper::findColumnByEntity($where, $join->getAlias()) !== null;
+    }
+
+    /**
+     * The type of the join of $entity, in another storage, when the SELECT joins it row by row as one statement would:
+     * a join the query wrote keeps its type (only INNER and LEFT compose), and without one (a comma or a role) takes
+     * the type of its relation; a join added for a tuple column is INNER when the relation is required. Null for a join
+     * added for a condition only, which stays a semi-join (DECISIONS 2026-10-22).
+     */
+    protected function storageJoinType(
+        JoinInterface $join,
+        RelationInterface $relation,
+        QueryInterface $query,
+        EntityInterface $entity
+    ): ?string {
+        $joinType                   = $join->getJoinType();
+
+        if (isset($this->writtenJoins[$join])) {
+            return $joinType === '' || $joinType === JoinInterface::QUERY ? $this->relationJoinType($relation) : $joinType;
+        }
+
+        $tuple                      = $query->getTuple();
+
+        if (\array_key_exists($entity->getEntityName(), $this->storageJoinColumns)
+            || ($tuple !== null && SqlRelationResolverForJoin::namesJoinedEntity($tuple, $join, $entity))) {
+            return $relation->isRequired() ? JoinInterface::INNER : JoinInterface::LEFT;
+        }
+
+        return null;
+    }
+
+    /**
+     * Plans a join of $entity, in another storage, row by row: one query reads the rows of the main query, the other
+     * the related rows of $entity, and StorageJoinComposer joins them. A condition on $entity runs first in its query
+     * and restricts the main one to the keys read; otherwise the main query runs first and $entity is read by its keys.
+     *
+     * @throws QueryException when the query computes over the joined rows
+     */
+    protected function composeStorageJoin(
+        DirectRelationInterface $relation,
+        JoinInterface $join,
+        SqlQueryCommandInterface $fromCommand,
+        EntityInterface $entity,
+        string $joinType
+    ): void {
+        $fromQuery                  = $fromCommand->getContainedSqlQuery();
+
+        // The columns of the entity are told apart by its name: a second join of it would take the first one's.
+        if (($joinType !== JoinInterface::INNER && $joinType !== JoinInterface::LEFT)
+            || \array_key_exists($entity->getEntityName(), $this->storageJoins)) {
+            throw new QueryException([
+                'template'          => 'The {type} join of {entity}, in another storage, cannot be composed row by row'
+                                       . ' (only one INNER or LEFT join of an entity is): {query}',
+                'type'              => $joinType,
+                'entity'            => $entity->getEntityName(),
+                'query'             => $fromQuery->getAql(),
+            ]);
+        }
+
+        SqlRelationResolverForJoin::refuseUncomposable($fromQuery, $join, $entity);
+
+        $nullFilters                = $joinType === JoinInterface::LEFT
+                                    ? SqlRelationResolverForJoin::takeNullFilters($fromQuery, $join, $entity) : [];
+        // As isRestrictedBy(), but without the conditions takeNullFilters() took out of the WHERE.
+        $where                      = $fromQuery->getWhere();
+        $isRestricted               = $where !== null
+                                      && SqlRelationResolverForJoin::namesJoinedEntity($where, $join, $entity, true);
+        $relationToEntity           = $relation->getRightEntityName() === $entity->getEntityName()
+                                    ? $relation : $relation->reverseRelation();
+
+        $keepsEachRowOnce           = SqlRelationResolverForJoin::keepsEachRowOnce(
+            $entity, $relationToEntity, $joinType, $isRestricted, $nullFilters !== []
+        );
+
+        SqlRelationResolverForJoin::refuseCounting($fromQuery, $entity, $keepsEachRowOnce);
+
+        // A COUNT of rows the join keeps once is the COUNT of the main query restricted to the rows that have a
+        // related row: nothing to compose, and a hidden key column would break the count.
+        if ($fromQuery->getResolvedAction() === QueryInterface::ACTION_COUNT) {
+            $this->restrictCountByStorageJoin($relationToEntity, $join, $fromCommand, $entity, $isRestricted);
+
+            return;
+        }
+
+        $toCommand                  = $this->newSecondaryCommand(
+            $isRestricted ? ExecutionPlanInterface::RIGHT : ExecutionPlanInterface::LEFT, new Select($entity->getEntityName())
+        );
+
+        $this->getExecutionPlan()->addCommand($toCommand);
+
+        if ($isRestricted) {
+            $relatedKeys            = SqlRelationResolverForSelect::restrictByKeys($toCommand, $relationToEntity->reverseRelation(), $fromCommand);
+            $mainKeys               = self::aliases(SqlRelationResolverForSelect::readKeyColumns(
+                $fromCommand, $relationToEntity->getLeftEntityName(), $relationToEntity->getLeftKey()->getKeyColumns()
+            ));
+        } else {
+            $mainKeys               = SqlRelationResolverForSelect::restrictByKeys($fromCommand, $relationToEntity, $toCommand);
+            $relatedKeys            = self::aliases(SqlRelationResolverForSelect::readKeyColumns(
+                $toCommand, $entity->getEntityName(), $relationToEntity->getRightKey()->getKeyColumns()
+            ));
+        }
+
+        $composer                   = new StorageJoinComposer($joinType, $mainKeys, $relatedKeys);
+
+        foreach ($nullFilters as $column) {
+            $aliases                = self::aliases(SqlRelationResolverForSelect::readKeyColumns($toCommand, $entity->getEntityName(), [$column]));
+            $composer->addNullFilter($aliases[0]);
+        }
+
+        foreach ($this->storageJoinColumns[$entity->getEntityName()] ?? [] as $alias) {
+            $composer->addColumn($alias, $alias);
+        }
+
+        unset($this->storageJoinColumns[$entity->getEntityName()]);
+        $this->storageJoins[$entity->getEntityName()] = [$joinType, $composer];
+
+        $toCommand->getResultProcessingPlan()->addResultReader(new ResultReaderCallback($composer->readResult(...)));
+        $this->getExecutionPlan()->addResultComposer($composer);
+        $join->setSubstitution(new NodeWithCommand($toCommand));
+    }
+
+    /**
+     * A COUNT whose join keeps each main row once: a LEFT join without a condition on $entity changes nothing, and a
+     * restricted one runs the query of $entity first and counts the main rows among its keys.
+     */
+    protected function restrictCountByStorageJoin(
+        DirectRelationInterface $relationToEntity,
+        JoinInterface $join,
+        SqlQueryCommandInterface $fromCommand,
+        EntityInterface $entity,
+        bool $isRestricted
+    ): void {
+        if (false === $isRestricted) {
+            $join->substituteToNullNode();
+
+            return;
+        }
+
+        $toCommand                  = $this->newSecondaryCommand(ExecutionPlanInterface::RIGHT, new Select($entity->getEntityName()));
+        $this->getExecutionPlan()->addCommand($toCommand);
+        SqlRelationResolverForSelect::restrictByKeys($toCommand, $relationToEntity->reverseRelation(), $fromCommand);
+        $join->setSubstitution(new NodeWithCommand($toCommand));
+    }
+
+    /**
+     * A tuple column of $entityName moved to the query of that entity: its value comes from there, by the same alias.
+     */
+    protected function addStorageJoinColumn(string $entityName, string $alias): void
+    {
+        $composer                   = $this->storageJoins[$entityName][1] ?? null;
+
+        if ($composer !== null) {
+            $composer->addColumn($alias, $alias);
+        } else {
+            $this->storageJoinColumns[$entityName][] = $alias;
+        }
+    }
+
+    /**
+     * @param array<string, TupleColumnInterface> $tupleColumns
+     * @return list<string>
+     */
+    private static function aliases(array $tupleColumns): array
+    {
+        return \array_values(\array_map(static fn(TupleColumnInterface $column) => $column->getAliasOrColumnName(), $tupleColumns));
     }
 
     /**
@@ -1699,6 +1932,16 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return JoinInterface::QUERY;
         }
 
+        return $this->relationJoinType($relation);
+    }
+
+    /**
+     * The type of a join along $relation inside one statement.
+     *
+     * @throws  EntityDescriptorException
+     */
+    protected function relationJoinType(RelationInterface $relation): string
+    {
         return match ($relation->getRelationType()) {
             RelationInterface::CHILD,
             RelationInterface::BELONGS_TO,

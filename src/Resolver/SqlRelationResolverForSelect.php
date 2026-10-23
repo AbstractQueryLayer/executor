@@ -11,7 +11,6 @@ use IfCastle\AQL\Dsl\Sql\Parameter\Parameter;
 use IfCastle\AQL\Dsl\Sql\Parameter\ParameterInterface;
 use IfCastle\AQL\Dsl\Sql\Parameter\ParameterTuple;
 use IfCastle\AQL\Dsl\Sql\Parameter\ParameterTupleInterface;
-use IfCastle\AQL\Dsl\Sql\Tuple\TupleColumn;
 use IfCastle\AQL\Dsl\Sql\Tuple\TupleColumnInterface;
 use IfCastle\AQL\Entity\Relation\DirectRelationInterface;
 use IfCastle\AQL\Executor\Exceptions\QueryException;
@@ -68,23 +67,18 @@ class SqlRelationResolverForSelect implements ResultReaderInterface, DisposableI
      * the key of the relation as a hidden column, and $toCommand compares its side of the relation with the list of
      * keys read. $fromCommand must run first; its entity is the left one of $relation.
      *
+     * @return list<string> the aliases of the hidden key columns of $fromCommand, in the order of the left key
      * @throws QueryException when the relation cannot be compared with a list of keys
      */
     public static function restrictByKeys(
         SqlQueryCommandInterface $fromCommand,
         DirectRelationInterface $relation,
         SqlQueryCommandInterface $toCommand
-    ): void {
-        $leftEntityName             = $relation->getLeftEntityName();
-        $tuple                      = $fromCommand->getContainedSqlQuery()->getTuple();
-        $tupleColumns               = [];
-
+    ): array {
         // 1. Need add to $fromCommand results left key from $relation
-        foreach ($relation->getLeftKey()->getKeyColumns() as $column) {
-            $tupleColumn            = new TupleColumn(new Column($column, $leftEntityName));
-            $tupleColumns[$column]  = $tupleColumn;
-            $tuple->addHiddenColumn($tupleColumn);
-        }
+        $tupleColumns               = self::readKeyColumns(
+            $fromCommand, $relation->getLeftEntityName(), $relation->getLeftKey()->getKeyColumns()
+        );
 
         $conditions                 = $relation->generateConditions();
 
@@ -110,6 +104,27 @@ class SqlRelationResolverForSelect implements ResultReaderInterface, DisposableI
 
         // 2. Add dependencies to WHERE
         $toCommand->getContainedSqlQuery()->getWhere()->add($conditions);
+
+        return \array_values(\array_map(static fn(TupleColumnInterface $column) => $column->getAliasOrColumnName(), $tupleColumns));
+    }
+
+    /**
+     * Makes the query of $command read $columns of $entityName as hidden columns. Each gets an alias of its own, so it
+     * neither takes the place of a column of the query with the same name nor is taken by one.
+     *
+     * @param list<string> $columns
+     * @return array<string, TupleColumnInterface> by column name
+     */
+    public static function readKeyColumns(SqlQueryCommandInterface $command, string $entityName, array $columns): array
+    {
+        $tuple                      = $command->getContainedSqlQuery()->getTuple();
+        $tupleColumns               = [];
+
+        foreach ($columns as $column) {
+            $tupleColumns[$column]  = $tuple->resolveHiddenColumn(new Column($column, $entityName));
+        }
+
+        return $tupleColumns;
     }
 
     /**

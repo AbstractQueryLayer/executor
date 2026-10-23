@@ -13,7 +13,6 @@ use IfCastle\AQL\Executor\Exceptions\QueryException;
 use IfCastle\AQL\Executor\Exceptions\UnknownQueryAction;
 use IfCastle\AQL\Executor\Plan\ExecutionContextInterface;
 use IfCastle\AQL\Executor\Plan\ExecutionPlan;
-use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryExecutorInterface;
 use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryInterface;
 use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryStorageInterface;
 use IfCastle\AQL\Result\InsertUpdateResultInterface;
@@ -199,13 +198,13 @@ class AqlExecutor implements AqlExecutorInterface
     }
 
     /**
-     * @phpstan-assert PreprocessedQueryExecutorInterface $executor
+     * @phpstan-assert QueryExecutorBasicAbstract $executor
      *
      * @throws QueryException
      */
     protected function preprocessForReuse(BasicQueryInterface $query, QueryExecutorInterface $executor): void
     {
-        if (false === $executor instanceof PreprocessedQueryExecutorInterface) {
+        if (false === $executor instanceof QueryExecutorBasicAbstract) {
             throw new QueryException([
                 'query'             => $query,
                 'executor'          => $executor::class,

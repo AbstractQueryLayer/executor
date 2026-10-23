@@ -27,7 +27,6 @@ use IfCastle\AQL\Executor\Plan\QueryPlanInterface;
 use IfCastle\AQL\Executor\Plan\SqlQueryCommand;
 use IfCastle\AQL\Executor\PostAction\PostActionCommand;
 use IfCastle\AQL\Executor\PostAction\PostActionInterface;
-use IfCastle\AQL\Executor\Preprocessing\PreprocessedQueryExecutorInterface;
 use IfCastle\AQL\Executor\Transformer\NodeTransformer;
 use IfCastle\AQL\Executor\Transformer\Sql\CteTransformer;
 use IfCastle\AQL\Executor\Transformer\Sql\SqlTransformer;
@@ -43,8 +42,7 @@ use IfCastle\Exceptions\UnexpectedValueType;
 abstract class QueryExecutorBasicAbstract implements
     QueryExecutorWithPlanInterface,
     QueryPlanInterface,
-    AutoResolverInterface,
-    PreprocessedQueryExecutorInterface
+    AutoResolverInterface
 {
     protected ContainerInterface $container;
 
@@ -157,13 +155,21 @@ abstract class QueryExecutorBasicAbstract implements
         return $found;
     }
 
-    #[\Override]
+    /**
+     * True while executePreprocessed() runs: a run that overlaps it, from another coroutine, must not use this
+     * executor, since the transaction of a run is bound to the executor for the time of the run.
+     */
     public function isExecuting(): bool
     {
         return $this->isExecuting;
     }
 
-    #[\Override]
+    /**
+     * Runs the query this executor preprocessed again, without normalising it anew: in $transaction, or outside any
+     * transaction when it is null. Nothing of the run stays bound to the executor after it returns.
+     *
+     * @throws \LogicException when $query is not the query this executor preprocessed, or a run is in progress
+     */
     public function executePreprocessed(BasicQueryInterface $query, ?TransactionInterface $transaction = null): ResultInterface
     {
         $queryContext               = $this->queryContext?->get();
@@ -312,7 +318,7 @@ abstract class QueryExecutorBasicAbstract implements
     {
         $executor                   = $query->getNodeContext()?->getQueryExecutor();
 
-        if ($executor instanceof PreprocessedQueryExecutorInterface) {
+        if ($executor instanceof self) {
             // A run that overlaps another gets a query of its own (AqlExecutor), so its secondary queries never overlap.
             return $executor->executePreprocessed($query, $this->queryContext?->get()?->getTransaction());
         }

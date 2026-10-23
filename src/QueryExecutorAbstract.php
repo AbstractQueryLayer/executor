@@ -1619,7 +1619,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             $this->queryContext->get()->setSqlStatement($statement);
             $context                = $this->queryContext->get();
 
-            $operation              = static fn() => $storage->executeStatement($statement, [], $context);
+            $operation              = static fn() => $storage->executeStatement($statement, $context);
 
         } elseif ($statement !== null) {
 
@@ -1632,7 +1632,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             }
 
             $context                = $this->queryContext->get();
-            $operation              = static fn() => $storage->executeStatement($statement, [], $context);
+            $operation              = static fn() => $storage->executeStatement($statement, $context);
         } else {
             $sql                    = $this->renderSql($query);
 

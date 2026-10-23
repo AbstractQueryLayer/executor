@@ -1313,6 +1313,10 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             $result->setHiddenColumns(\count($query->getTuple()?->getHiddenColumns() ?? []));
         } elseif ($result instanceof InsertUpdateResultSetterInterface && $query instanceof QueryInterface && $query->isInsertUpdate()) {
             $result->setInsertUpdateResult($this->buildInsertUpdateResult($query, $storage, $result));
+        } elseif ($result instanceof InsertUpdateResultSetterInterface && $query instanceof QueryInterface && $query->isDelete()) {
+            // A DELETE inserts nothing: no entity, so neither the last insert id of the connection nor values of the
+            // WHERE pose as the key of a new row.
+            $result->setInsertUpdateResult(new InsertUpdateResult(query: $query, affected: $result->affected()));
         }
 
         return $result;

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IfCastle\AQL\Executor;
 
 use IfCastle\AQL\Dsl\BasicQueryInterface;
+use IfCastle\AQL\Dsl\Node\NodeInterface;
 use IfCastle\AQL\Dsl\Sql\Query\QueryInterface;
 use IfCastle\AQL\Dsl\Sql\Query\SelectInterface;
 use IfCastle\AQL\Dsl\Sql\Query\WithInterface;
@@ -91,6 +92,8 @@ abstract class QueryExecutorBasicAbstract implements
     ): ResultInterface {
         if (false === $this->wasProcessed) {
             $this->preprocessing($query, $executionContext);
+        } else {
+            $this->transformAddedNodes($query);
         }
 
         if ($this->executionPlan !== null) {
@@ -98,6 +101,60 @@ abstract class QueryExecutorBasicAbstract implements
         }
 
         return $this->executeQueryWithContext($query);
+    }
+
+    /**
+     * A query that already ran keeps its transformed tree, and a node added to it afterwards, such as a condition
+     * of where(), renders nothing until it is transformed. Such nodes are transformed in the context of the query,
+     * as the first run transformed their siblings.
+     *
+     * @throws QueryException when the query runs through an execution plan: its secondary queries were built from
+     *                        the tree of the first run and would not see the added nodes
+     */
+    protected function transformAddedNodes(BasicQueryInterface $query): void
+    {
+        $addedNodes                 = self::findAddedNodes($query);
+
+        if ($addedNodes === []) {
+            return;
+        }
+
+        if ($this->executionPlan !== null) {
+            throw new QueryException([
+                'query'             => $query,
+                'template'          => 'A node added after the first run of a query with an execution plan is not'
+                                       . ' supported; build the query again: {query}',
+            ]);
+        }
+
+        foreach ($addedNodes as $node) {
+            $this->queryContext?->get()?->transform($node);
+        }
+    }
+
+    /**
+     * Untransformed nodes under transformed parents. A node with a substitution renders the substitution, so its
+     * children are not searched.
+     *
+     * @return list<NodeInterface>
+     */
+    private static function findAddedNodes(NodeInterface $node): array
+    {
+        $found                      = [];
+
+        foreach ($node->getChildNodes() as $child) {
+            if ($child instanceof NodeInterface === false) {
+                continue;
+            }
+
+            if ($child->isNotTransformed()) {
+                $found[]            = $child;
+            } elseif ($child->getSubstitution() === null) {
+                $found              = [...$found, ...self::findAddedNodes($child)];
+            }
+        }
+
+        return $found;
     }
 
     #[\Override]

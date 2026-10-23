@@ -418,7 +418,8 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     /**
      * Whether the WHERE of the query names at most one row of the entity: it is an AND of equalities between a
      * constant and every primary key column, each named by its property or its typical name (`@id`). Only the top
-     * level of the WHERE counts; an entity without a primary key has no such filter.
+     * level of the WHERE counts, and only columns of the entity itself; an entity without a primary key has no such
+     * filter.
      */
     protected static function filtersEveryPrimaryKeyColumn(QueryInterface $query, EntityInterface $entity): bool
     {
@@ -439,13 +440,45 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
                 ? $condition->getLeftNode()
                 : null;
 
-            if ($column instanceof ColumnInterface) {
+            if ($column instanceof ColumnInterface && self::isColumnOfEntity($column, $entity, $query)) {
                 $name               = $column->getColumnName();
                 $filtered[$entity->getProperty($name, false)?->getName() ?? $name] = true;
             }
         }
 
         return \array_diff($primaryKey->getKeyColumns(), \array_keys($filtered)) === [];
+    }
+
+    /**
+     * Whether the column is one of the entity's own: unqualified, or qualified by the entity, by the alias of the
+     * FROM, or by the parent entity its property is inherited from. A column of a joined entity with the same name
+     * as a key column fixes a row of that entity, not of this one.
+     */
+    private static function isColumnOfEntity(
+        ColumnInterface $column,
+        EntityInterface $entity,
+        QueryInterface $query
+    ): bool
+    {
+        $qualifier                  = $column->getEntityName();
+
+        if ($qualifier === null || $qualifier === '') {
+            return true;
+        }
+
+        $owners                     = [
+            $entity->getEntityName(),
+            $query->getFrom()?->getSubject()->getSubjectAlias(),
+            $entity->getProperty($column->getColumnName(), false)?->getInheritedFrom(),
+        ];
+
+        foreach ($owners as $owner) {
+            if ($owner !== null && $owner !== '' && \ucfirst($owner) === \ucfirst($qualifier)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

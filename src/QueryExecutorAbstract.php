@@ -15,6 +15,7 @@ use IfCastle\AQL\Dsl\Relation\RelationDirection;
 use IfCastle\AQL\Dsl\Relation\RelationInterface;
 use IfCastle\AQL\Dsl\Sql\Column\Column;
 use IfCastle\AQL\Dsl\Sql\Column\ColumnInterface;
+use IfCastle\AQL\Dsl\Sql\Conditions\Conditions;
 use IfCastle\AQL\Dsl\Sql\Conditions\ConditionsInterface;
 use IfCastle\AQL\Dsl\Sql\Constant\ConstantInterface;
 use IfCastle\AQL\Dsl\Sql\Constant\ConstantTupleInterface;
@@ -378,7 +379,77 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
+        if ($query instanceof QueryInterface && $query->isModifying()
+            && $query->isOption(QueryInterface::BY_PRIMARY_KEY)) {
+            $this->refuseWithoutPrimaryKeyFilter($query, $context);
+        }
+
         $this->postHandleQueryAfter($query, $context);
+    }
+
+    /**
+     * Whether the WHERE of the query names at most one row of the entity: it is an AND of equalities between a
+     * constant and every primary key column, each named by its property or its typical name (`@id`). Only the top
+     * level of the WHERE counts; an entity without a primary key has no such filter.
+     */
+    protected static function filtersEveryPrimaryKeyColumn(QueryInterface $query, EntityInterface $entity): bool
+    {
+        $primaryKey                 = $entity->getPrimaryKey();
+        $where                      = $query->getWhere();
+
+        if ($primaryKey === null || $where instanceof Conditions === false
+            || $where->getType() !== Conditions::TYPE_AND) {
+            return false;
+        }
+
+        $filtered                   = [];
+
+        foreach ($where->getChildNodes() as $condition) {
+            $column                 = $condition instanceof LROperationInterface
+                                      && $condition->getOperation() === LROperationInterface::EQU
+                                      && $condition->getRightNode() instanceof ConstantInterface
+                ? $condition->getLeftNode()
+                : null;
+
+            if ($column instanceof ColumnInterface) {
+                $name               = $column->getColumnName();
+                $filtered[$entity->getProperty($name, false)?->getName() ?? $name] = true;
+            }
+        }
+
+        return \array_diff($primaryKey->getKeyColumns(), \array_keys($filtered)) === [];
+    }
+
+    /**
+     * A query marked BY_PRIMARY_KEY promises to change one row. A filter that misses a key column matches every row
+     * sharing the other columns, and LIMIT 1 would change an arbitrary one of them, so the query is refused.
+     *
+     * @throws QueryException
+     */
+    private function refuseWithoutPrimaryKeyFilter(QueryInterface $query, NodeContextInterface $context): void
+    {
+        $entity                     = $context->getCurrentEntity();
+
+        if (self::filtersEveryPrimaryKeyColumn($query, $entity)) {
+            return;
+        }
+
+        if ($entity->getPrimaryKey() === null) {
+            throw new QueryException([
+                'query'             => $query,
+                'entity'            => $entity->getEntityName(),
+                'template'          => 'The query {query} changes one row of {entity} by its primary key, but {entity}'
+                                       . ' declares no primary key',
+            ]);
+        }
+
+        throw new QueryException([
+            'query'                 => $query,
+            'entity'                => $entity->getEntityName(),
+            'columns'               => \implode(', ', $entity->getPrimaryKey()->getKeyColumns()),
+            'template'              => 'The query {query} changes one row of {entity} by its primary key, but its'
+                                       . ' WHERE does not fix every key column ({columns}) with an equality',
+        ]);
     }
 
     protected function postHandleQueryAfter(BasicQueryInterface $query, NodeContextInterface $context): void {}

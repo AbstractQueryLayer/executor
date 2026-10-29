@@ -20,8 +20,8 @@ use IfCastle\AQL\Executor\Exceptions\QueryException;
 
 /**
  * The rules of a SELECT that joins an entity of another storage row by row (StorageJoinComposer): the rows of both
- * queries are joined after they are read, so whatever SQL computes over the joined rows (grouping, aggregates, an
- * order by the other entity, a LIMIT that counts joined rows) cannot run in either query and is refused.
+ * queries are joined after they are read, so whatever SQL computes over the joined rows (grouping, DISTINCT,
+ * aggregates, an order by the other entity, a LIMIT that counts joined rows) cannot run in either query and is refused.
  */
 final class SqlRelationResolverForJoin
 {
@@ -60,6 +60,7 @@ final class SqlRelationResolverForJoin
         $reason                     = match (true) {
             self::inUnion($query)                         => 'a UNION reads the key of the join in one member only',
             ($query->getGroupBy()?->getChildNodes() ?? []) !== [] => 'GROUP BY groups the joined rows',
+            $query instanceof SelectInterface && $query->isDistinct() => 'DISTINCT drops repeated joined rows',
             $query->getHaving()?->isConditionsExist() === true => 'HAVING filters the joined groups',
             self::selectsEveryColumn($query)              => 'SELECT * names no columns of the joined entity',
             self::hasAggregate($query)                    => 'an aggregate computes over the joined rows',

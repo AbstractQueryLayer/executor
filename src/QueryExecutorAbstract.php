@@ -73,8 +73,10 @@ use IfCastle\AQL\Result\TupleInterface;
 use IfCastle\AQL\Storage\AqlStorageInterface;
 use IfCastle\AQL\Storage\Exceptions\RecoverableException;
 use IfCastle\AQL\Storage\SqlStatementFactoryInterface;
+use IfCastle\AQL\Storage\SqlStatementInterface;
 use IfCastle\AQL\Storage\SqlStorageInterface;
 use IfCastle\AQL\Storage\StorageCollectionInterface;
+use IfCastle\AQL\Storage\StorageInterface;
 use IfCastle\Exceptions\RequiredValueEmpty;
 use IfCastle\Exceptions\UnexpectedValueType;
 
@@ -1117,26 +1119,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         NodeContextInterface $context,
         EntityInterface      $entity,
     ): void {
-        $this->refuseSecondaryQueryUnderLock($context->getBasicQuery());
-
-        if ($context->getCurrentSqlQuery()->isUpdate() && NodeHelper::inAssign($column)) {
-            throw new QueryException([
-                'template'          => 'The column {column} of {entity} cannot be used in SET of {query}: the entity is'
-                                       . ' in another storage, which an UPDATE reads only to filter its own rows',
-                'column'            => $column->getColumnName(),
-                'entity'            => $entity->getEntityName(),
-                'query'             => $context->getCurrentSqlQuery()->getAql(),
-            ]);
-        }
-
-        if (NodeHelper::inCteOrSubquery($column)) {
-            throw new QueryException([
-                'template'          => 'Generation of separate queries is not possible in the context '
-                                       . 'of CTE expressions or subqueries. Column {expression} in query {query}',
-                'expression'        => $column->getAql(),
-                'query'             => $context->getCurrentSqlQuery()->getAql(),
-            ]);
-        }
+        $this->refuseSeparateQueryForColumn($column, $context, $entity);
 
         /**
          * Inconsistent queries in the current implementation have an important limitation.
@@ -1155,25 +1138,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             'column'                => $column->getColumnName(),
         ]);
 
-        $basicNode                  = NodeHelper::ascendToQueryBasicNode($column);
-
-        if ($basicNode === null) {
-            throw new QueryException([
-                'template'          => 'The basic node is not found in the query {query} for {targetNode}',
-                'query'             => $context->getCurrentSqlQuery()->getAql(),
-                'targetNode'        => $targetNode->getAql(),
-            ]);
-        }
-
-        if (false === $basicNode instanceof ChildNodeMutableInterface) {
-            throw new QueryException([
-                'template'          => 'The basic node type {node} does not support '
-                                       . 'adding child nodes (ChildNodeMutableInterface): {nodeAql} in {query}',
-                'node'              => $basicNode->getNodeName(),
-                'nodeAql'           => $basicNode->getAql(),
-                'query'             => $context->getCurrentSqlQuery()->getAql(),
-            ]);
-        }
+        $basicNode                  = self::basicNodeOf($column, $targetNode, $context);
 
         if (NodeHelper::inWhere($column)) {
             $this->refuseUnmovableCondition($targetNode, $basicNode, $context, $entity);
@@ -1201,6 +1166,73 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         $this->defineSeparateQueryAndNormalizeWith($context, $entity, static fn(QueryInterface $query) =>
             $query->addChildrenToBasicNode($basicNodeName, $targetNodeCopy)
         );
+    }
+
+    /**
+     * @throws QueryException when the column cannot move to a query of its own: under a lock, in the SET of an UPDATE,
+     *                        in a CTE or a subquery
+     */
+    private function refuseSeparateQueryForColumn(
+        ColumnInterface      $column,
+        NodeContextInterface $context,
+        EntityInterface      $entity,
+    ): void {
+        $this->refuseSecondaryQueryUnderLock($context->getBasicQuery());
+
+        if ($context->getCurrentSqlQuery()->isUpdate() && NodeHelper::inAssign($column)) {
+
+            throw new QueryException([
+                'template'          => 'The column {column} of {entity} cannot be used in SET of {query}: the entity is'
+                                       . ' in another storage, which an UPDATE reads only to filter its own rows',
+                'column'            => $column->getColumnName(),
+                'entity'            => $entity->getEntityName(),
+                'query'             => $context->getCurrentSqlQuery()->getAql(),
+            ]);
+        }
+
+        if (NodeHelper::inCteOrSubquery($column)) {
+            throw new QueryException([
+                'template'          => 'Generation of separate queries is not possible in the context '
+                                       . 'of CTE expressions or subqueries. Column {expression} in query {query}',
+                'expression'        => $column->getAql(),
+                'query'             => $context->getCurrentSqlQuery()->getAql(),
+            ]);
+        }
+
+    }
+
+    /**
+     * The clause of the query (the tuple, WHERE, ...) that holds the column; the expression of the column moves to the
+     * same clause of the separate query.
+     *
+     * @throws QueryException when the clause is not found or takes no child nodes
+     */
+    private static function basicNodeOf(
+        ColumnInterface      $column,
+        NodeInterface        $targetNode,
+        NodeContextInterface $context
+    ): NodeInterface&ChildNodeMutableInterface {
+        $basicNode                  = NodeHelper::ascendToQueryBasicNode($column);
+
+        if ($basicNode === null) {
+            throw new QueryException([
+                'template'          => 'The basic node is not found in the query {query} for {targetNode}',
+                'query'             => $context->getCurrentSqlQuery()->getAql(),
+                'targetNode'        => $targetNode->getAql(),
+            ]);
+        }
+
+        if (false === $basicNode instanceof ChildNodeMutableInterface) {
+            throw new QueryException([
+                'template'          => 'The basic node type {node} does not support '
+                                       . 'adding child nodes (ChildNodeMutableInterface): {nodeAql} in {query}',
+                'node'              => $basicNode->getNodeName(),
+                'nodeAql'           => $basicNode->getAql(),
+                'query'             => $context->getCurrentSqlQuery()->getAql(),
+            ]);
+        }
+
+        return $basicNode;
     }
 
     /**
@@ -1247,32 +1279,14 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
         }
 
         if ($this->isRestrictedBy($fromQuery, $join, $toEntity)) {
-            $toCommand              = $this->newSecondaryCommand(
-                ExecutionPlanInterface::RIGHT, new Select($toEntity->getEntityName())
-            );
-
-            $this->getExecutionPlan()->addCommand($toCommand);
-            SqlRelationResolverForSelect::restrictByKeys($toCommand, self::relationFrom($toEntity, $relation), $fromCommand);
-            $join->setSubstitution(new NodeWithCommand($toCommand));
+            $this->restrictByEntityQuery(self::relationFrom($toEntity, $relation), $join, $fromCommand, $toEntity);
 
             return;
         }
 
-        $toQuery                    = match ($queryAction) {
-            QueryInterface::ACTION_COUNT,
-            QueryInterface::ACTION_SELECT  => new Select($toEntity->getEntityName()),
-            QueryInterface::ACTION_INSERT,
-            QueryInterface::ACTION_REPLACE => new Insert($toEntity->getEntityName()),
-            QueryInterface::ACTION_COPY    => new Copy($toEntity->getEntityName()),
-
-            default                        => throw new QueryException([
-                'query'             => $fromQuery,
-                'action'            => $fromQuery->getResolvedAction(),
-                'template'          => 'Unknown parent query action {action} to create separate Query for Join',
-            ]),
-        };
-
-        $toCommand                  = $this->newSecondaryCommand($this->relationToSide($relation), $toQuery);
+        $toCommand                  = $this->newSecondaryCommand(
+            $this->relationToSide($relation), self::newSeparateQuery($fromQuery, $toEntity)
+        );
         $this->getExecutionPlan()->addCommand($toCommand);
 
         if ($queryAction === QueryInterface::ACTION_SELECT) {
@@ -1281,6 +1295,45 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             SqlRelationResolverForInsert::resolve($context, $toCommand, $relation, $fromCommand);
         }
 
+        $join->setSubstitution(new NodeWithCommand($toCommand));
+    }
+
+    /**
+     * The query of $entity, in another storage, that a query of the action of $fromQuery joins.
+     *
+     * @throws QueryException for an action that joins no query of another storage
+     */
+    private static function newSeparateQuery(QueryInterface $fromQuery, EntityInterface $entity): QueryInterface
+    {
+        return match ($fromQuery->getResolvedAction()) {
+            QueryInterface::ACTION_COUNT,
+            QueryInterface::ACTION_SELECT  => new Select($entity->getEntityName()),
+            QueryInterface::ACTION_INSERT,
+            QueryInterface::ACTION_REPLACE => new Insert($entity->getEntityName()),
+            QueryInterface::ACTION_COPY    => new Copy($entity->getEntityName()),
+
+            default                        => throw new QueryException([
+                'query'             => $fromQuery,
+                'action'            => $fromQuery->getResolvedAction(),
+                'template'          => 'Unknown parent query action {action} to create separate Query for Join',
+            ]),
+        };
+    }
+
+    /**
+     * Runs the query of $entity first and restricts the query of $fromCommand to the keys it reads, as a semi-join.
+     *
+     * @param DirectRelationInterface $relationFromEntity the relation whose left side is $entity
+     */
+    private function restrictByEntityQuery(
+        DirectRelationInterface $relationFromEntity,
+        JoinInterface $join,
+        SqlQueryCommandInterface $fromCommand,
+        EntityInterface $entity
+    ): void {
+        $toCommand                  = $this->newSecondaryCommand(ExecutionPlanInterface::RIGHT, new Select($entity->getEntityName()));
+        $this->getExecutionPlan()->addCommand($toCommand);
+        SqlRelationResolverForSelect::restrictByKeys($toCommand, $relationFromEntity, $fromCommand);
         $join->setSubstitution(new NodeWithCommand($toCommand));
     }
 
@@ -1404,19 +1457,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
     ): void {
         $fromQuery                  = $fromCommand->getContainedSqlQuery();
 
-        // The columns of the entity are told apart by its name: a second join of it would take the first one's.
-        if (($joinType !== JoinInterface::INNER && $joinType !== JoinInterface::LEFT)
-            || \array_key_exists($entity->getEntityName(), $this->storageJoins)) {
-            throw new QueryException([
-                'template'          => 'The {type} join of {entity}, in another storage, cannot be composed row by row'
-                                       . ' (only one INNER or LEFT join of an entity is): {query}',
-                'type'              => $joinType,
-                'entity'            => $entity->getEntityName(),
-                'query'             => $fromQuery->getAql(),
-            ]);
-        }
-
-        SqlRelationResolverForJoin::refuseUncomposable($fromQuery, $join, $entity);
+        $this->refuseUncomposableJoin($fromQuery, $join, $entity, $joinType);
 
         $nullFilters                = $joinType === JoinInterface::LEFT
                                     ? SqlRelationResolverForJoin::takeNullFilters($fromQuery, $join, $entity) : [];
@@ -1447,6 +1488,58 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
 
         $this->getExecutionPlan()->addCommand($toCommand);
 
+        $composer                   = new StorageJoinComposer(
+            $joinType, ...self::joinKeys($relationToEntity, $fromCommand, $toCommand, $entity, $isRestricted)
+        );
+
+        foreach ($nullFilters as $column) {
+            $aliases                = self::aliases(SqlRelationResolverForSelect::readKeyColumns($toCommand, $entity->getEntityName(), [$column]));
+            $composer->addNullFilter($aliases[0]);
+        }
+
+        $this->addStorageJoin($entity->getEntityName(), $joinType, $composer);
+        $toCommand->getResultProcessingPlan()->addResultReader(new ResultReaderCallback($composer->readResult(...)));
+        $this->getExecutionPlan()->addResultComposer($composer);
+        $join->setSubstitution(new NodeWithCommand($toCommand));
+    }
+
+    /**
+     * @throws QueryException when the join of $entity cannot be composed row by row
+     */
+    private function refuseUncomposableJoin(
+        QueryInterface $fromQuery,
+        JoinInterface $join,
+        EntityInterface $entity,
+        string $joinType
+    ): void {
+        // The columns of the entity are told apart by its name: a second join of it would take the first one's.
+        if (($joinType !== JoinInterface::INNER && $joinType !== JoinInterface::LEFT)
+            || \array_key_exists($entity->getEntityName(), $this->storageJoins)) {
+            throw new QueryException([
+                'template'          => 'The {type} join of {entity}, in another storage, cannot be composed row by row'
+                                       . ' (only one INNER or LEFT join of an entity is): {query}',
+                'type'              => $joinType,
+                'entity'            => $entity->getEntityName(),
+                'query'             => $fromQuery->getAql(),
+            ]);
+        }
+
+        SqlRelationResolverForJoin::refuseUncomposable($fromQuery, $join, $entity);
+    }
+
+    /**
+     * Links the main query and the query of $entity by the keys of the relation: the query that runs second is
+     * restricted to the keys the first one reads.
+     *
+     * @return array{list<string>, list<string>} the aliases of the key columns in the main rows and in the related rows
+     */
+    private static function joinKeys(
+        DirectRelationInterface $relationToEntity,
+        SqlQueryCommandInterface $fromCommand,
+        SqlQueryCommandInterface $toCommand,
+        EntityInterface $entity,
+        bool $isRestricted
+    ): array {
         if ($isRestricted) {
             $relatedKeys            = SqlRelationResolverForSelect::restrictByKeys($toCommand, $relationToEntity->reverseRelation(), $fromCommand);
             $mainKeys               = self::aliases(SqlRelationResolverForSelect::readKeyColumns(
@@ -1459,23 +1552,7 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ));
         }
 
-        $composer                   = new StorageJoinComposer($joinType, $mainKeys, $relatedKeys);
-
-        foreach ($nullFilters as $column) {
-            $aliases                = self::aliases(SqlRelationResolverForSelect::readKeyColumns($toCommand, $entity->getEntityName(), [$column]));
-            $composer->addNullFilter($aliases[0]);
-        }
-
-        foreach ($this->storageJoinColumns[$entity->getEntityName()] ?? [] as $alias) {
-            $composer->addColumn($alias, $alias);
-        }
-
-        unset($this->storageJoinColumns[$entity->getEntityName()]);
-        $this->storageJoins[$entity->getEntityName()] = [$joinType, $composer];
-
-        $toCommand->getResultProcessingPlan()->addResultReader(new ResultReaderCallback($composer->readResult(...)));
-        $this->getExecutionPlan()->addResultComposer($composer);
-        $join->setSubstitution(new NodeWithCommand($toCommand));
+        return [$mainKeys, $relatedKeys];
     }
 
     /**
@@ -1495,10 +1572,20 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             return;
         }
 
-        $toCommand                  = $this->newSecondaryCommand(ExecutionPlanInterface::RIGHT, new Select($entity->getEntityName()));
-        $this->getExecutionPlan()->addCommand($toCommand);
-        SqlRelationResolverForSelect::restrictByKeys($toCommand, $relationToEntity->reverseRelation(), $fromCommand);
-        $join->setSubstitution(new NodeWithCommand($toCommand));
+        $this->restrictByEntityQuery($relationToEntity->reverseRelation(), $join, $fromCommand, $entity);
+    }
+
+    /**
+     * The composer of the join of $entityName; it takes the tuple columns moved to the query of the entity before.
+     */
+    private function addStorageJoin(string $entityName, string $joinType, StorageJoinComposer $composer): void
+    {
+        foreach ($this->storageJoinColumns[$entityName] ?? [] as $alias) {
+            $composer->addColumn($alias, $alias);
+        }
+
+        unset($this->storageJoinColumns[$entityName]);
+        $this->storageJoins[$entityName] = [$joinType, $composer];
     }
 
     /**
@@ -1546,40 +1633,15 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
      */
     protected function executeTransformedQuery(BasicQueryInterface $query): ResultInterface
     {
-        if ($query->isNotTransformed()) {
-            throw new QueryException([
-                'query'             => $query,
-                'template'          => 'The query is not normalized',
-            ]);
-        }
-
-        $this->refuseLockingReadOutsideTransaction($query);
-
-        if ($query->getQueryStorage() === null) {
-            throw new QueryException([
-                'query'             => $query,
-                'template'          => 'Query storage undefined',
-            ]);
-        }
-
-        $storage                    = $this->storageCollection->findStorage($query->getQueryStorage());
-
-        if ($storage === null) {
-            throw new QueryException([
-                'query'             => $query,
-                'template'          => 'The query storage {storage} is not found',
-                'storage'           => $query->getQueryStorage(),
-            ]);
-        }
+        $storage                    = $this->findQueryStorage($query);
 
         // Support for AQL queries
         if ($storage instanceof AqlStorageInterface) {
 
-            $result                     = $storage->executeAql($query, $this->queryContext);
+            $result                 = $storage->executeAql($query, $this->queryContext);
 
-            // Save hidden columns count
-            if ($result instanceof TupleInterface && $query instanceof QueryInterface) {
-                $result->setHiddenColumns(\count($query->getTuple()?->getHiddenColumns() ?? []));
+            if ($query instanceof QueryInterface) {
+                self::saveHiddenColumns($query, $result);
             }
 
             return $result;
@@ -1597,66 +1659,129 @@ abstract class QueryExecutorAbstract extends QueryExecutorBasicAbstract implemen
             ]);
         }
 
-        $statement                  = $this->queryContext->get()->getSqlStatement();
+        $operation                  = $this->defineSqlOperation($query, $storage);
 
-        // Support prepared queries
-        if ($query->isOption(QueryInterface::PREPARING) && $storage instanceof SqlStatementFactoryInterface) {
-
-            // Rendered and prepared again on every run: a value written into the text (a value list, a LIMIT) may
-            // have changed since the last one, and a statement belongs to the connection of the run that prepared it.
-            [$sql, $constants]      = $this->renderPrepared($query);
-
-            if ($sql === '') {
-                return new ResultNull();
-            }
-
-            $statement              = $storage->createStatement($sql, $this->queryContext);
-
-            foreach ($constants as $constant) {
-                $statement->bindParameter($constant);
-            }
-
-            $this->queryContext->get()->setSqlStatement($statement);
-            $context                = $this->queryContext->get();
-
-            $operation              = static fn() => $storage->executeStatement($statement, $context);
-
-        } elseif ($statement !== null) {
-
-            if ($storage instanceof SqlStatementFactoryInterface === false) {
-                throw new QueryException([
-                    'query'         => $query,
-                    'template'      => 'The storage {storage} does not support the SqlStatementFactoryInterface',
-                    'storage'       => $query->getQueryStorage(),
-                ]);
-            }
-
-            $context                = $this->queryContext->get();
-            $operation              = static fn() => $storage->executeStatement($statement, $context);
-        } else {
-            $sql                    = $this->renderSql($query);
-
-            if ($sql === '') {
-                return new ResultNull();
-            }
-
-            $operation              = static fn(NodeContextInterface $context) => $storage->executeSql($sql, $context);
+        if ($operation === null) {
+            return new ResultNull();
         }
 
         $result                     = $this->tryToExecuteTwice($operation, $query);
 
-        // Save hidden columns count
-        if ($result instanceof TupleInterface && $query instanceof QueryInterface && $query->isSelect()) {
-            $result->setHiddenColumns(\count($query->getTuple()?->getHiddenColumns() ?? []));
-        } elseif ($result instanceof InsertUpdateResultSetterInterface && $query instanceof QueryInterface && $query->isInsertUpdate()) {
+        if ($query instanceof QueryInterface) {
+            $this->saveSqlResultOf($query, $storage, $result);
+        }
+
+        return $result;
+    }
+
+    /**
+     * The storage a transformed query runs on.
+     *
+     * @throws QueryException when the query is not transformed, has no storage or names a storage that is not found
+     */
+    private function findQueryStorage(BasicQueryInterface $query): StorageInterface
+    {
+        if ($query->isNotTransformed()) {
+            throw new QueryException([
+                'query'             => $query,
+                'template'          => 'The query is not normalized',
+            ]);
+        }
+
+        $this->refuseLockingReadOutsideTransaction($query);
+
+        if ($query->getQueryStorage() === null) {
+            throw new QueryException([
+                'query'             => $query,
+                'template'          => 'Query storage undefined',
+            ]);
+        }
+
+        return $this->storageCollection->findStorage($query->getQueryStorage()) ?? throw new QueryException([
+            'query'                 => $query,
+            'template'              => 'The query storage {storage} is not found',
+            'storage'               => $query->getQueryStorage(),
+        ]);
+    }
+
+    /**
+     * The call that runs the query on the SQL storage: a statement prepared now for a PREPARING query, the statement
+     * the context holds, or the rendered SQL. Null when the query renders to no SQL.
+     *
+     * @return (callable(NodeContextInterface): ResultInterface)|null
+     * @throws QueryException when the context holds a statement and the storage does not run statements
+     */
+    private function defineSqlOperation(BasicQueryInterface $query, SqlStorageInterface $storage): ?callable
+    {
+        $context                    = $this->queryContext->get();
+        $statement                  = $context->getSqlStatement();
+
+        if ($query->isOption(QueryInterface::PREPARING) && $storage instanceof SqlStatementFactoryInterface) {
+            $statement              = $this->prepareStatement($query, $storage);
+        } elseif ($statement === null) {
+            $sql                    = $this->renderSql($query);
+
+            return $sql === '' ? null : static fn(NodeContextInterface $context) => $storage->executeSql($sql, $context);
+        } elseif ($storage instanceof SqlStatementFactoryInterface === false) {
+            throw new QueryException([
+                'query'             => $query,
+                'template'          => 'The storage {storage} does not support the SqlStatementFactoryInterface',
+                'storage'           => $query->getQueryStorage(),
+            ]);
+        }
+
+        if ($statement === null) {
+            return null;
+        }
+
+        return static fn() => $storage->executeStatement($statement, $context);
+    }
+
+    /**
+     * Prepares the query on the storage and keeps the statement in the context. Null when the query renders to no SQL.
+     */
+    private function prepareStatement(
+        BasicQueryInterface $query,
+        SqlStorageInterface&SqlStatementFactoryInterface $storage
+    ): ?SqlStatementInterface {
+        // Rendered and prepared again on every run: a value written into the text (a value list, a LIMIT) may
+        // have changed since the last one, and a statement belongs to the connection of the run that prepared it.
+        [$sql, $constants]          = $this->renderPrepared($query);
+
+        if ($sql === '') {
+            return null;
+        }
+
+        $statement                  = $storage->createStatement($sql, $this->queryContext);
+
+        foreach ($constants as $constant) {
+            $statement->bindParameter($constant);
+        }
+
+        $this->queryContext->get()->setSqlStatement($statement);
+
+        return $statement;
+    }
+
+    /** Writes into the result of an SQL query what the query knows and the storage does not. */
+    private function saveSqlResultOf(QueryInterface $query, SqlStorageInterface $storage, ResultInterface $result): void
+    {
+        if ($query->isSelect()) {
+            self::saveHiddenColumns($query, $result);
+        } elseif ($result instanceof InsertUpdateResultSetterInterface && $query->isInsertUpdate()) {
             $result->setInsertUpdateResult($this->buildInsertUpdateResult($query, $storage, $result));
-        } elseif ($result instanceof InsertUpdateResultSetterInterface && $query instanceof QueryInterface && $query->isDelete()) {
+        } elseif ($result instanceof InsertUpdateResultSetterInterface && $query->isDelete()) {
             // A DELETE inserts nothing: no entity, so neither the last insert id of the connection nor values of the
             // WHERE pose as the key of a new row.
             $result->setInsertUpdateResult(new InsertUpdateResult(query: $query, affected: $result->affected()));
         }
+    }
 
-        return $result;
+    private static function saveHiddenColumns(QueryInterface $query, ResultInterface $result): void
+    {
+        if ($result instanceof TupleInterface) {
+            $result->setHiddenColumns(\count($query->getTuple()?->getHiddenColumns() ?? []));
+        }
     }
 
     /**
